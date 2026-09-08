@@ -724,12 +724,13 @@
     var models = available.models || [];
     function modelVersion(id, revision) {
       var model = (inv.models || {})[id] || {};
-      return (revision || (inv.installed ? 'Verification pending' : '')) +
+      return (revision || (inv.installed && inv.legacy !== false ? 'Verification pending' : 'Not installed')) +
         (model.state === 'damaged' ? ' — damaged; repair needed' : model.state === 'verified' ? ' — verified' : '');
     }
     if (models.length) {
       models.forEach(function (model) {
-        row(model.id, modelVersion(model.id, model.installed), model.available);
+        var current = (inv.models || {})[model.id] || {};
+        row(model.id, modelVersion(model.id, current.revision || model.installed), model.available);
       });
     } else {
       var ids = Object.keys(inv.models || {});

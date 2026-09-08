@@ -207,3 +207,14 @@ test('reopening a prepared update shows its saved versions without re-enabling a
   assert.match(ui.nodes.get('ss-runtime-note').textContent, /prepared/);
   assert.ok(!ui.requests.some(r => r.endpoint === '/server/runtime/check'));
 });
+
+test('completed update renders current model receipt instead of the old plan inventory', async () => {
+  const ui = harness({'/server/runtime/inventory': {installed: true, legacy: false,
+    dependencies: {'audio-separator':'0.47.0'}, models: {bs_roformer_sw:{revision:'verified-r1',state:'verified'}}},
+    '/server/runtime/status': {state: 'active', active: false, checked_plan: {can_update:false,
+      available: {models: [{id:'bs_roformer_sw',installed:null,available:'verified-r1'}]}}}});
+  await ui.flush();
+  const rows = ui.nodes.get('ss-runtime-versions').innerHTML;
+  assert.match(rows, /verified-r1 — verified/);
+  assert.ok(!rows.includes('Verification pending'));
+});
