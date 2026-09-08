@@ -541,3 +541,42 @@ def test_progress_retains_pip_package_line_separately_from_phase(sandbox):
     assert ru.status(cfg)["line"] == "Collecting torch~=2.8.0"
     assert seen[0]["phase"] == "Resolving / downloading"
     assert seen[0]["line"] == "Collecting torch~=2.8.0"
+
+
+@pytest.mark.parametrize("model,device,error", [
+    ("htdemucs_6s", "cpu", "Choose bs_roformer_sw before Restore"),
+    ("bs_roformer_sw", "cuda", "Choose CPU before Restore"),
+    ("bs_roformer_sw", "cuda:1", "Choose CPU before Restore"),
+])
+def test_rollback_rejects_incompatible_selection_before_touching_running_server(sandbox, fake_runtime, model, device, error):
+    cfg, base = sandbox
+    ru.apply_update(cfg, make_plan(cfg)["plan_id"])
+    previous = ru.active_root(cfg)
+    ru.apply_update(cfg, make_plan(cfg)["plan_id"])
+    active = ru.active_root(cfg)
+    pointer_before = (base / "active.json").read_bytes()
+    before_activate = mock.Mock()
+    with mock.patch.object(ds, "is_running", return_value=(True, 9123)), \
+            mock.patch.object(ds, "stop_server") as stop, mock.patch.object(ru, "_start_verified") as start:
+        with pytest.raises(ValueError, match=error):
+            ru.rollback(cfg, model=model, device=device, before_activate=before_activate)
+    stop.assert_not_called()
+    start.assert_not_called()
+    before_activate.assert_not_called()
+    assert (base / "active.json").read_bytes() == pointer_before
+    assert ru.active_root(cfg) == active
+    assert previous.exists()
+
+
+def test_recovery_rollback_does_not_silently_substitute_recorded_model_for_user_selection(sandbox, fake_runtime):
+    cfg, base = sandbox
+    ru.apply_update(cfg, make_plan(cfg)["plan_id"])
+    previous = ru.active_root(cfg)
+    ru.apply_update(cfg, make_plan(cfg)["plan_id"])
+    pointer_before = (base / "active.json").read_bytes()
+    ru._persist(cfg, active=False, state="recovery_required", activation={"previous_generation": previous.name,
+                "was_running": True, "device": "cpu", "model": "bs_roformer_sw", "port": 9123})
+    with mock.patch.object(ds, "stop_server") as stop, pytest.raises(ValueError, match="Choose bs_roformer_sw"):
+        ru.rollback(cfg, model="htdemucs_6s", device="cpu")
+    stop.assert_not_called()
+    assert (base / "active.json").read_bytes() == pointer_before

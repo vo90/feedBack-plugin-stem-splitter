@@ -1129,13 +1129,20 @@ def rollback(config_dir: Path, *, port: int = 7865, device: str = "", model: str
         target = activation.get("previous_generation") or current.get("previous_generation")
         start_after = start_after or bool(activation.get("was_running"))
         port = int(activation.get("port") or port)
-        device = activation.get("device", device)
-        model = activation.get("model", model)
     if not target:
         raise ValueError("No previous runtime generation is available")
     root = _generation(config_dir, target)
-    if target != "legacy" and not _read(root / "receipt.json").get("validated"):
-        raise ValueError("The previous generation is incomplete; recovery material was preserved")
+    if target != "legacy":
+        receipt = _read(root / "receipt.json")
+        if not receipt.get("validated"):
+            raise ValueError("The previous generation is incomplete; recovery material was preserved")
+        if model not in receipt.get("models", {}):
+            supported = ", ".join(sorted(receipt.get("models", {}))) or "a model included in that generation"
+            raise ValueError(f"The previous runtime does not include {model}. Choose {supported} before Restore.")
+        gpu = bool(_read(root / "install.json").get("gpu"))
+        if device.startswith("cuda") and not gpu:
+            raise ValueError("The previous runtime has CPU libraries. Choose CPU before Restore.")
+        _validate_device(device, {"gpu": gpu})
     if not (root / "src" / "server.py").is_file():
         raise ValueError("The previous server source is missing")
     with _operation(config_dir, "validating", recovery=True) as cancel:
