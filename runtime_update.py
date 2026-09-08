@@ -37,6 +37,10 @@ _COMMIT = re.compile(r"^[a-fA-F0-9]{40}$")
 _LOCK = threading.RLock()
 _RUNNING: dict[str, threading.Event] = {}
 _TERMINAL = {"idle", "active", "current", "rolled_back", "canceled", "failed", "discarded"}
+# Readers and antivirus can briefly hold Windows handles without delete sharing.
+# Bound the wait to 1.585 seconds; never remove the destination to work around it.
+_REPLACE_RETRY_DELAYS = (.01, .025, .05, .1, .2, .4, .8)
+_WINDOWS_REPLACE_ERRORS = {5, 32, 33}  # access denied, sharing violation, lock violation
 
 
 class UpdateCancelled(RuntimeError):
@@ -74,9 +78,20 @@ def _atomic_json(path: Path, value: dict) -> None:
             json.dump(value, handle, indent=2, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, path)
+        for attempt in range(len(_REPLACE_RETRY_DELAYS) + 1):
+            try:
+                os.replace(temp, path)
+                break
+            except OSError as exc:
+                if (os.name != "nt" or getattr(exc, "winerror", None) not in _WINDOWS_REPLACE_ERRORS
+                        or attempt == len(_REPLACE_RETRY_DELAYS)):
+                    raise
+                time.sleep(_REPLACE_RETRY_DELAYS[attempt])
     finally:
-        temp.unlink(missing_ok=True)
+        # A cleanup sharing violation must not hide the original write/replace
+        # failure. A locked leftover is harmless; it is never an active pointer.
+        with contextlib.suppress(OSError):
+            temp.unlink(missing_ok=True)
 
 
 def _digest(value) -> str:
