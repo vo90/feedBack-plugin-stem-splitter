@@ -280,12 +280,13 @@ def _invalidate_running() -> None:
         _running_memo.clear()
 
 
-# Sizing the server dir means walking pylibs/ + cache/ - several GB once the weights
-# land. server_status() is polled every 5s by the settings page while models download,
-# so recomputing it each time would be a continuous disk scan for a number that barely
-# moves. Memoize it (and let the caller skip it entirely).
+# Sizing all retained generations can take minutes on Windows. Status and lifecycle
+# responses must never wait for that display-only scan. Keep one refresh per profile
+# in the background, serving the last known total until it completes.
 _disk_memo: dict[str, tuple[float, int]] = {}
 _disk_lock = threading.Lock()
+_disk_refreshing: set[str] = set()
+_disk_revision: dict[str, int] = {}
 _DISK_TTL = 30.0  # seconds
 
 
@@ -305,17 +306,49 @@ def _dir_size(p: Path) -> int:
     return total
 
 
+def _invalidate_disk_size(config_dir: Path) -> None:
+    key = str(config_dir)
+    with _disk_lock:
+        _disk_memo.pop(key, None)
+        _disk_revision[key] = _disk_revision.get(key, 0) + 1
+        # An older scan may still be walking a changed/deleted tree. Keep its
+        # single-flight slot occupied, but prevent it publishing a stale total.
+
+
 def _server_disk_bytes(config_dir: Path) -> int:
     key = str(config_dir)
     now = time.monotonic()
     with _disk_lock:
         hit = _disk_memo.get(key)
+        previous = hit[1] if hit else 0
         if hit and now - hit[0] < _DISK_TTL:
-            return hit[1]
-    size = _dir_size(server_dir(config_dir))
-    with _disk_lock:
-        _disk_memo[key] = (now, size)
-    return size
+            return previous
+        if key in _disk_refreshing:
+            return previous
+        _disk_refreshing.add(key)
+        revision = _disk_revision.get(key, 0)
+
+    def refresh() -> None:
+        size = previous
+        try:
+            size = _dir_size(server_dir(config_dir))
+        except Exception:
+            # Discard/uninstall can remove a directory during enumeration. Keep
+            # the last total and retry after the TTL, without breaking status.
+            log.debug("stem_splitter: disk-size refresh failed", exc_info=True)
+        finally:
+            with _disk_lock:
+                if _disk_revision.get(key, 0) == revision:
+                    _disk_memo[key] = (time.monotonic(), size)
+                _disk_refreshing.discard(key)
+
+    try:
+        threading.Thread(target=refresh, name="stem_splitter-disk-size", daemon=True).start()
+    except Exception:
+        with _disk_lock:
+            _disk_refreshing.discard(key)
+        log.debug("stem_splitter: could not start disk-size refresh", exc_info=True)
+    return previous
 
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -1517,8 +1550,7 @@ def install_server(config_dir: Path, gpu: bool = False, ref: str | None = None,
     _install_diffq(target, progress_cb,
                    base=0.12 + (len(steps) / n) * 0.86, span=0.86 / n)
 
-    with _disk_lock:
-        _disk_memo.clear()   # the tree just changed materially
+    _invalidate_disk_size(config_dir)
     try:
         (installation_root(config_dir) / "install.json").write_text(json.dumps({
             "gpu": bool(gpu),
@@ -1644,8 +1676,7 @@ def uninstall_server(config_dir: Path) -> dict:
     except Exception as e:
         log.warning("stem_splitter: stop before uninstall failed: %s", e)
     shutil.rmtree(server_dir(config_dir), ignore_errors=True)
-    with _disk_lock:
-        _disk_memo.clear()
+    _invalidate_disk_size(config_dir)
     try:
         state_file(config_dir).unlink(missing_ok=True)
     except OSError as e:

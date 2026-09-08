@@ -609,6 +609,8 @@ def _operation(config_dir: Path, state: str, *, recovery: bool = False):
             finally:
                 _lock_file(handle, unlock=True)
                 handle.close()
+                import demucs_server as ds
+                ds._invalidate_disk_size(config_dir)
 
 
 def cancel_update(config_dir: Path) -> dict:
@@ -1296,4 +1298,6 @@ def discard_candidate(config_dir: Path) -> dict:
         finally:
             _lock_file(handle, unlock=True)
             handle.close()
+            import demucs_server as ds
+            ds._invalidate_disk_size(config_dir)
         return status(config_dir)
