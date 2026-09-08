@@ -215,6 +215,7 @@
   </div>
 
   <div id="ss-runtime-panel" style="margin-top:1rem">
+    <p class="ss-note" id="ss-runtime-source" hidden></p>
     <p class="ss-note" id="ss-runtime-note" aria-live="polite">Check for server, library and model updates. Existing songs are kept as they are.</p>
     <table style="width:100%;text-align:left;font-size:.85rem;border-collapse:collapse">
       <thead><tr><th>Component</th><th>Installed</th><th>Available</th></tr></thead>
@@ -710,6 +711,16 @@
   function renderRuntimeUpdates() {
     var inv = runtimeInventory || {}, state = runtimeState || {};
     var plan = runtimePlan || state.checked_plan;
+    var source = state.source || inv.source || (plan && plan.source) || {};
+    var localSource = source.kind === 'local_test';
+    $('ss-runtime-source').hidden = !localSource;
+    $('ss-runtime-source').textContent = localSource ?
+      (source.label || 'Local test source (not published)') +
+      (source.ref ? ' — ' + source.ref : '') +
+      (source.commit ? ' @ ' + source.commit.slice(0, 8) : '') +
+      (source.error ? '. ' + source.error :
+        '. This test launcher selects the server version. Libraries and models are downloaded and verified normally.') : '';
+    $('ss-srv-ref').disabled = localSource;
     var have = inv.dependencies || {}, available = plan && plan.available || {};
     var deps = available.dependencies || {};
     var rows = [];
