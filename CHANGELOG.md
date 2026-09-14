@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Separate **Install NVIDIA GPU support** from **Run on**: CUDA-enabled
+  libraries also support CPU processing. Candidate separation checks use the
+  same explicit CPU isolation as the updated server. Changing the running
+  device shows a restart notice until the server has restarted.
+- Show the actual execution device, selected separator and model verification
+  separately. Models intentionally left for first use say **Starts when needed**;
+  older servers with an unverified skipped startup check say **Not checked at
+  startup**. Optional transcription and pitch features appear in details.
+
 ## 0.7.0
 
 ### Update the complete managed local separator from Settings

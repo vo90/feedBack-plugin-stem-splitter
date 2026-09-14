@@ -182,7 +182,17 @@
     downloaded. This is the only thing here that downloads anything; app startup never downloads and
     is never blocked by it.</p>
   <div class="ss-statusbar" id="ss-srv-chips"><span class="ss-chip off">Checking…</span></div>
+  <div class="ss-statusbar" id="ss-srv-model" aria-live="polite"></div>
   <p class="ss-note" id="ss-srv-note"></p>
+  <details class="ss-adv" id="ss-srv-other-features" hidden>
+    <summary>Other server features</summary>
+    <div class="ss-statusbar" id="ss-srv-feature-chips"></div>
+    <p class="ss-note">These features do not need to be prepared to split stems with the selected model.</p>
+  </details>
+  <details class="ss-adv" id="ss-srv-model-errors" hidden>
+    <summary>Preparation failure details</summary>
+    <pre class="ss-note" id="ss-srv-model-error-text" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+  </details>
 
   <div class="row">
     <div>
@@ -190,19 +200,22 @@
       <input type="text" id="ss-srv-port" value="7865" style="width:5.5rem">
     </div>
     <div>
-      <label for="ss-srv-device">Device</label>
+      <label for="ss-srv-device">Run on</label>
       <select id="ss-srv-device">
         <option value="">Auto</option>
         <option value="cpu">CPU</option>
-        <option value="cuda">CUDA (GPU)</option>
+        <option value="cuda">NVIDIA GPU</option>
       </select>
     </div>
     <div>
       <label><input type="checkbox" id="ss-srv-autostart"> Start with the app</label>
       <label><input type="checkbox" id="ss-srv-global"> Use for the whole app</label>
-      <label><input type="checkbox" id="ss-srv-gpu"> <span id="ss-srv-gpu-label">Use GPU (CUDA)</span></label>
+      <label><input type="checkbox" id="ss-srv-gpu"> <span id="ss-srv-gpu-label">Install NVIDIA GPU support</span></label>
     </div>
   </div>
+  <p class="ss-note">Run on takes effect when the server next starts. Auto uses an available NVIDIA GPU, otherwise CPU.</p>
+  <p class="ss-note" id="ss-srv-device-note" aria-live="polite" hidden></p>
+  <p class="ss-note">NVIDIA GPU support applies to the next installation or update. It also supports CPU mode; switching to CPU does not require reinstalling.</p>
 
   <div class="row" style="margin-top:.6rem">
     <button class="ss-actionbtn blue" id="ss-srv-install"><span id="ss-srv-install-label">Prepare server installation</span></button>
@@ -369,6 +382,11 @@
   var runtimePlanSignature = null;
   var runtimeState = null;
   var runtimeChecking = false;
+  var savedServerDevice = null;
+  var savedRemoteModel = 'bs_roformer_sw';
+  var serverStatusRequestId = 0;
+  var serverSaveChain = Promise.resolve();
+  var serverStartPending = false;
 
   function loadConfig() {
     j('/config').then(function (cfg) {
@@ -376,10 +394,12 @@
       $('ss-set-split').value = s.split_engine || 'auto';
       $('ss-set-lyrics').value = s.lyrics_engine || 'auto';
       $('ss-set-remote-model').value = s.remote_model || 'bs_roformer_sw';
+      savedRemoteModel = $('ss-set-remote-model').value;
       $('ss-set-wx-model').value = s.whisperx_model || 'medium';
       $('ss-set-lang').value = s.language || '';
       $('ss-srv-port').value = s.local_server_port || 7865;
       $('ss-srv-device').value = s.local_server_device || '';
+      savedServerDevice = $('ss-srv-device').value;
       $('ss-srv-autostart').checked = !!s.local_server_autostart;
       $('ss-srv-global').checked = !!s.local_server_use_globally;
       if (s.local_server_gpu !== null && typeof s.local_server_gpu !== 'undefined') {
@@ -391,6 +411,7 @@
       // /config carries only the cheap install map now; the full status
       // (with the expensive cache-size walk) comes from /engine_status.
       renderStatus(null);
+      if (lastServerStatus) renderModelStatus(lastServerStatus);
     }).catch(function () {});
     loadServerStatus();
   }
@@ -443,7 +464,12 @@
     };
     // The server card saves itself (see saveServerSettings) - don't duplicate its keys here.
     j('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-      .then(function () { $('ss-set-saved').textContent = 'Saved.'; setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000); });
+      .then(function () {
+        savedRemoteModel = body.remote_model || 'bs_roformer_sw';
+        $('ss-set-saved').textContent = 'Saved.';
+        setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000);
+        return loadServerStatus();
+      });
   }
 
   var MAX_LOG_LINES = 500;
@@ -566,7 +592,7 @@
             runtimePlan = null;
           }
           setServerButtons(false);
-          if (m.status && !isRuntime) renderServerStatus(m.status); else loadServerStatus();
+          if (m.status && !isRuntime) acceptServerStatus(m.status); else loadServerStatus();
         }
       } else if (m.type === 'server_error') {
         if (isDk(m.op)) {
@@ -649,16 +675,26 @@
     // `true` the first time ANY other field on this card is touched, permanently
     // disabling auto-detection. Only send it once the user has actually set it.
     if (gpuTouched) body.local_server_gpu = $('ss-srv-gpu').checked;
-    return j('/config', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+    // Preserve snapshot order even if an earlier autosave is still in flight.
+    // A failed old save is reported to its caller and does not block a newer choice.
+    var save = serverSaveChain.catch(function () {}).then(function () {
+      return j('/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
     }).then(function () {
+      var deviceChanged = savedServerDevice !== body.local_server_device;
+      savedServerDevice = body.local_server_device;
       var el = $('ss-srv-saved');
-      if (!el) return;
-      var prev = el.textContent;
-      el.textContent = 'Saved ✓';
-      setTimeout(function () { el.textContent = prev; }, 1500);
+      if (el) {
+        var prev = el.textContent;
+        el.textContent = 'Saved ✓';
+        setTimeout(function () { el.textContent = prev; }, 1500);
+      }
+      if (deviceChanged) return loadServerStatus();
     });
+    serverSaveChain = save;
+    return save;
   }
 
   function queueServerSave() {
@@ -685,8 +721,8 @@
   var serverButtonsRevision = 0;
   function setServerButtons(disabled) {
     serverButtonsRevision++;
-    serverBusy = !!disabled;
-    var d = disabled || !serverManageable;   // never re-enable an unsupported section
+    serverBusy = !!disabled || serverStartPending;
+    var d = serverBusy || !serverManageable;   // never re-enable an unsupported section
     SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = d; });
     if (lastServerStatus) { renderInstallBtn(lastServerStatus); renderToggle(lastServerStatus); }
     renderRuntimeButtons();
@@ -961,12 +997,12 @@
     var g = st.gpu_detected;
     if (g) {
       gpuBox.disabled = false;
-      gpuLabel.textContent = 'Use GPU (CUDA) - ' + g.name;
+      gpuLabel.textContent = 'Install NVIDIA GPU support — ' + g.name;
       if (!gpuTouched && !st.installed) gpuBox.checked = true;
     } else {
       gpuBox.disabled = true;
       gpuBox.checked = false;
-      gpuLabel.textContent = 'Use GPU (CUDA) - no NVIDIA GPU detected';
+      gpuLabel.textContent = 'Install NVIDIA GPU support — no NVIDIA GPU detected';
     }
 
     if (!st.installed) {
@@ -998,32 +1034,126 @@
       label.textContent = 'Stopped — click to start';
     }
   }
-  var WARMUP_TONE = { ready: 'ok', skipped: 'ok', downloading: 'warn',
-                      pending: 'off', failed: 'bad', evicted: 'off' };
+  function modelName(model) {
+    var names = {bs_roformer_sw: 'BS Roformer (6 stems)', htdemucs_6s: 'HTDemucs (6 stems)',
+      htdemucs: 'HTDemucs', htdemucs_ft: 'HTDemucs fine-tuned'};
+    return names[model] || model || 'Stem model';
+  }
 
-  // The server's warmup keys are NOT our models_present keys. It reports the default separator
-  // as `demucs` (the backend treats that as an alias for bs_roformer_sw — see _model_ready) and
-  // names the aligner differently again. A raw present[k] lookup misses, leaving the chip on
-  // "downloading" for a file sitting right there — which is the exact bug the loading-vs-
-  // downloading change exists to fix, reintroduced through a key mismatch.
-  var PRESENT_KEY = {
-    demucs: 'bs_roformer_sw',
-    bs_roformer_sw: 'bs_roformer_sw',
-    whisperx: 'whisperx',
-    whisperx_aligners: 'whisperx_aligners',
-    aligner: 'whisperx_aligners',
-    align: 'whisperx_aligners',
-  };
+  function featureName(key) {
+    if (key.indexOf('whisperx_aligners:') === 0)
+      return 'Word timing (' + key.slice('whisperx_aligners:'.length) + ')';
+    var names = {demucs: 'Demucs separator', bs_roformer_sw: 'BS Roformer separator',
+      whisperx: 'Lyrics transcription', crepe: 'Pitch detection',
+      whisperx_aligners: 'Word timing', aligner: 'Word timing', align: 'Word timing'};
+    return names[key] || String(key).replace(/_/g, ' ');
+  }
 
-  // An unmapped key falls back to the key itself rather than guessing.
-  function isPresent(present, key) {
-    return !!present[PRESENT_KEY[key] || key];
+  function legacyModelState(value, notSelected) {
+    var raw = typeof value === 'string' ? value.toLowerCase() : '';
+    if (raw.indexOf('failed') === 0) return {state: 'failed', label: 'Preparation failed',
+      detail: raw.indexOf('failed:') === 0 ? value : null};
+    if (notSelected) return {state: 'not_selected', label: 'Not selected'};
+    if (raw === 'ready') return {state: 'ready', label: 'Ready to use'};
+    if (['pending', 'loading', 'downloading'].indexOf(raw) >= 0)
+      return {state: 'loading', label: 'Preparing model…'};
+    if (raw === 'skipped') return {state: 'on_demand', label: 'Not checked at startup'};
+    if (raw === 'evicted') return {state: 'on_demand', label: 'Starts when needed'};
+    return {state: 'unknown', label: 'Status not reported'};
+  }
+
+  function serverPresentation(st) {
+    if (st.presentation && st.presentation.model) return st.presentation;
+    // Conservative fallback for an older backend: warmup alone never verifies assets.
+    var health = st.health || {}, warmup = health.warmup || {}, model = savedRemoteModel;
+    var key = model;
+    if (!(key in warmup) && model !== 'bs_roformer_sw' && health.demucs_model === model) key = 'demucs';
+    var selected = legacyModelState(warmup[key], false), features = {};
+    Object.keys(warmup).forEach(function (name) {
+      if (name === key || (typeof warmup[name] === 'object' && !Object.keys(warmup[name] || {}).length)) return;
+      if (name === 'whisperx_aligners' && warmup[name] && typeof warmup[name] === 'object') {
+        Object.keys(warmup[name]).forEach(function (language) {
+          features[name + ':' + language] = legacyModelState(warmup[name][language], false);
+        });
+        return;
+      }
+      features[name] = legacyModelState(warmup[name], name === 'demucs' || name === 'bs_roformer_sw');
+    });
+    var busy = function (entry) { return entry.state === 'loading' || entry.state === 'downloading'; };
+    return {selected_model: model, model: selected, features: features,
+      requested_device: savedServerDevice || 'auto', effective_device: health.device || null,
+      restart_required: false, settled: !busy(selected) && !Object.keys(features).some(function (name) {
+        return busy(features[name]);
+      })};
+  }
+
+  function modelStateChip(entry, prefix) {
+    entry = entry || {};
+    var tones = {ready: 'ok', on_demand: 'off', loading: 'info', downloading: 'info',
+      failed: 'bad', missing: 'warn', unknown: 'off', stopped: 'off', not_selected: 'off'};
+    var label = entry.label || 'Status not reported';
+    if (entry.state === 'ready') label = 'Ready to use';
+    if (entry.state === 'on_demand' && entry.verified === true) label = 'Starts when needed';
+    var tone = entry.state === 'on_demand' && entry.verified === true ? 'info' : tones[entry.state] || 'off';
+    var busy = entry.state === 'loading' || entry.state === 'downloading';
+    return chip((prefix ? prefix + ': ' : '') + label, tone, {live: busy, dot: busy});
+  }
+
+  function renderModelStatus(st) {
+    var modelBar = $('ss-srv-model'), featuresBar = $('ss-srv-feature-chips');
+    if (!st || st.manageable === false) {
+      modelBar.innerHTML = '';
+      $('ss-srv-other-features').hidden = true;
+      $('ss-srv-model-errors').hidden = true;
+      return;
+    }
+    var p = serverPresentation(st), entry = p.model || {};
+    var chips = [chip('Selected separator: ' + modelName(p.selected_model), 'info')];
+    if (!st.installed) chips.push(chip('Not installed', 'off'));
+    else {
+      if (entry.verified === true) chips.push(chip('Installed and verified', 'ok'));
+      else if (entry.present === true) chips.push(chip('Model files found', 'info'));
+      chips.push(modelStateChip(entry));
+    }
+    modelBar.innerHTML = chips.join('');
+    var features = p.features || {}, keys = st.installed ? Object.keys(features) : [];
+    featuresBar.innerHTML = keys.map(function (key) {
+      return modelStateChip(features[key], featureName(key));
+    }).join('');
+    $('ss-srv-other-features').hidden = !keys.length;
+    var errors = [];
+    function addFailure(name, value) {
+      if (!value || value.state !== 'failed') return;
+      errors.push(name + ': ' + (value.detail ||
+        'The server reported a preparation failure without an error message.'));
+    }
+    if (st.installed) addFailure(modelName(p.selected_model), entry);
+    keys.forEach(function (key) { addFailure(featureName(key), features[key]); });
+    $('ss-srv-model-error-text').textContent = errors.join('\n\n');
+    $('ss-srv-model-errors').hidden = !errors.length;
+  }
+
+  function deviceName(device) {
+    if (device === 'cpu') return 'CPU';
+    if (/^cuda(?::\d+)?$/.test(device || '')) return 'NVIDIA GPU' + (device.indexOf(':') >= 0 ? ' ' + device.split(':')[1] : '');
+    return device === 'auto' || !device ? 'Auto' : device;
+  }
+
+  function renderDeviceNotice(st) {
+    var note = $('ss-srv-device-note'), p = st && serverPresentation(st);
+    note.hidden = !(st && st.running && p.restart_required);
+    note.className = 'ss-note warn';
+    note.textContent = note.hidden ? '' : 'Restart needed to apply Run on: ' + deviceName(p.requested_device) + '.'
+      + (p.effective_device ? ' The server is still using ' + deviceName(p.effective_device) + '.' : '');
   }
 
   function renderServerStatus(st) {
     lastServerStatus = st || null;
     var bar = $('ss-srv-chips'), note = $('ss-srv-note');
-    if (!st) { bar.innerHTML = chip('Status unavailable', 'bad'); return; }
+    if (!st) {
+      bar.innerHTML = chip('Status unavailable', 'bad');
+      renderModelStatus(null); renderDeviceNotice(null); return;
+    }
 
     // Deployments where a managed server can't work (no pip, read-only config dir):
     // disable the section and say why, rather than letting the user start an install
@@ -1035,6 +1165,7 @@
       renderInstallBtn(null);
       note.textContent = st.manage_reason || '';
       note.className = 'ss-note warn';
+      renderModelStatus(st); renderDeviceNotice(null);
       setServerButtons(true);
       return;
     }
@@ -1046,52 +1177,29 @@
     } else if (st.running) {
       chips.push(chip('Running · :' + st.port, 'ok', { dot: true, live: true }));
       var h = st.health || {};
-      if (h.device) chips.push(chip(h.device.toUpperCase() + (h.gpu ? ' · GPU' : ''),
-                                    h.gpu ? 'ok' : 'info'));
+      if (h.device) chips.push(chip('Using ' + deviceName(h.device),
+        /^cuda(?::\d+)?$/.test(h.device) ? 'ok' : 'info'));
     } else {
       chips.push(chip('Installed · stopped', 'warn', { dot: true }));
     }
 
-    chips.push(st.models_downloaded ? chip('Models downloaded', 'ok')
-                                    : chip('Models not downloaded', 'warn'));
-
-    // The case worth shouting about: a GPU is sitting right there, but the install
-    // built CPU-only torch, so every split runs at CPU speed for no reason.
+    // Installed GPU support and the device currently executing work are separate.
     var g = st.gpu_detected;
-    if (st.installed && g && !st.gpu_build) {
-      chips.push(chip('CPU-only build - GPU idle', 'warn',
-                      { title: g.name + ' detected. Reinstall with GPU to use it.' }));
-    } else if (st.installed && st.gpu_build) {
-      chips.push(chip('GPU build' + (g ? ' - ' + g.name : ''), 'ok'));
+    if (st.installed && st.gpu_build) {
+      chips.push(chip('NVIDIA GPU support installed', 'info'));
+    } else if (st.installed) {
+      chips.push(chip('CPU support installed', 'info'));
     } else if (!st.installed && g) {
-      chips.push(chip('GPU available - ' + g.name, 'info'));
+      chips.push(chip('NVIDIA GPU detected — ' + g.name, 'info'));
     }
-    if (st.running && st.models_ready) chips.push(chip('Warm · ready to split', 'ok'));
-
-    // Per-model warmup detail (pending / downloading / ready / failed).
-    var wu = (st.health || {}).warmup || {};
-    var present = st.models_present || {};
-    Object.keys(wu).forEach(function (k) {
-      var v = wu[k];
-      if (typeof v !== 'string') return;
-      // The server says "downloading" while it warms a model — even when it is only loading
-      // a cached file from disk into VRAM. Shown verbatim, that tells the user their weights
-      // are being re-fetched when nothing is crossing the wire, which is exactly how a
-      // 1-second RAM load gets reported as a bug. If we can see the file, say "loading".
-      var label = v, tone = WARMUP_TONE[v] || 'off';
-      if (v === 'downloading' && isPresent(present, k)) {
-        label = 'loading';
-        tone = 'info';
-      }
-      var busy = (v === 'downloading');
-      chips.push(chip(k + ': ' + label, tone, { live: busy, dot: busy }));
-    });
 
     if (st.disk_bytes) chips.push(chip(gb(st.disk_bytes) + ' on disk', 'info'));
     bar.innerHTML = chips.join('');
     renderToggle(st);
     renderInstallBtn(st);
     renderAdvanced(st);
+    renderModelStatus(st);
+    renderDeviceNotice(st);
 
     var notes = [];
     if (st.advisory) notes.push('⚠ ' + st.advisory);
@@ -1105,20 +1213,28 @@
   }
 
   function loadServerStatus() {
-    return j('/server_status').then(renderServerStatus).catch(function () {}).then(loadRuntimeStatus);
+    var requestId = ++serverStatusRequestId;
+    return j('/server_status').then(function (st) {
+      if (requestId !== serverStatusRequestId) return;
+      renderServerStatus(st);
+      return loadRuntimeStatus();
+    }).catch(function () {});
+  }
+
+  function acceptServerStatus(st) {
+    ++serverStatusRequestId;
+    renderServerStatus(st);
   }
 
   setInterval(function () {
     if (runtimeState && runtimeState.active) loadRuntimeStatus();
   }, 2000);
 
-  // Poll while the server is up but not yet warm, so the per-model warmup chips
-  // tick from pending -> downloading -> ready on their own. Idle otherwise (and
-  // stops entirely once everything is ready) so we're not hammering /health.
+  // Poll actual preparation, not skipped/on-demand states that have already settled.
   setInterval(function () {
     var st = lastServerStatus;
     if (!serverManageable || !st) return;
-    var busy = st.running && !st.models_ready;
+    var busy = st.running && serverPresentation(st).settled === false;
     if (busy) loadServerStatus();
   }, 5000);
 
@@ -1218,6 +1334,7 @@
   $('ss-srv-global').addEventListener('change', function () { syncGlobalUrl(lastServerStatus); });
 
   function serverOp(path, label) {
+    ++serverStatusRequestId;
     setServerButtons(true);
     $('ss-srv-progress').style.display = 'block';
     $('ss-srv-log').textContent = label + '…\n';
@@ -1235,7 +1352,7 @@
       // stop/uninstall answer synchronously with a status; install/start/prepare
       // stream over the WS and unlock on server_done/server_error.
       if (res && typeof res.installed !== 'undefined') {
-        renderServerStatus(res);
+        acceptServerStatus(res);
         setSrvBar(1, 'Done', true);
         setServerButtons(false);
       }
@@ -1249,15 +1366,33 @@
 
   $('ss-srv-install').addEventListener('click', checkRuntimeUpdates);
   $('ss-srv-toggle').addEventListener('click', function () {
+    if (serverStartPending) return Promise.resolve();
     var running = lastServerStatus && lastServerStatus.running;
     var label = $('ss-srv-toggle-label');
+    serverStartPending = !running;
+    ++serverStatusRequestId;
+    setServerButtons(true);
     setBtnTone('ss-srv-toggle', 'amber');
     $('ss-srv-toggle').classList.add('busy');
     label.textContent = running ? 'Stopping…' : 'Starting…';
-    serverOp(running ? '/server/stop' : '/server/start',
-             running ? 'Stopping server' : 'Starting server')
+    var action;
+    if (running) action = serverOp('/server/stop', 'Stopping server');
+    else {
+      // A quick device change followed by Start must use the saved new choice.
+      if (srvSaveTimer) { clearTimeout(srvSaveTimer); srvSaveTimer = null; }
+      action = saveServerSettings().then(function () {
+        serverStartPending = false;
+        return serverOp('/server/start', 'Starting server');
+      });
+    }
+    return action
       .then(loadServerStatus)      // settle the toggle from real status, not optimism
-      .catch(loadServerStatus);
+      .catch(function (error) {
+        serverStartPending = false;
+        setServerButtons(false);
+        $('ss-srv-saved').textContent = 'Could not save settings or start the server: ' + error;
+        return loadServerStatus();
+      });
   });
   $('ss-srv-uninstall').addEventListener('click', function () {
     if (!confirm('Remove the demucs server, its dependencies and all downloaded models?')) return;

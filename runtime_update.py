@@ -982,7 +982,9 @@ def _inference_smoke(config_dir: Path, root: Path, plan: dict, cancel):
     env = _candidate_env(config_dir, root, validation / "cache")
     device = plan.get("device") or ("cuda" if plan["gpu"] else "cpu")
     if device == "cpu":
-        env["CUDA_VISIBLE_DEVICES"] = ""
+        # An empty value can disagree between Windows CUDA and PyTorch/NVML
+        # device probes. The explicit no-GPU value keeps CPU inference consistent.
+        env["CUDA_VISIBLE_DEVICES"] = "-1"
     if spec["engine"] in {"audio-separator", "roformer"}:
         args = [sys.executable, str(source / "run_roformer.py"), "-m", spec["entrypoint"],
                 "-o", str(output), "-d", device, "--model-dir", str(root / "models" / model), str(fixture)]
