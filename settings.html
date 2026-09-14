@@ -228,6 +228,7 @@
   </div>
 
   <div id="ss-runtime-panel" style="margin-top:1rem">
+    <p class="ss-note" id="ss-runtime-source" hidden></p>
     <p class="ss-note" id="ss-runtime-note" aria-live="polite">Check for server, library and model updates. Existing songs are kept as they are.</p>
     <table style="width:100%;text-align:left;font-size:.85rem;border-collapse:collapse">
       <thead><tr><th>Component</th><th>Installed</th><th>Available</th></tr></thead>
@@ -730,6 +731,8 @@
   function renderRuntimeButtons() {
     var state = runtimeState || {};
     var busy = serverBusy || runtimeChecking || !!state.active;
+    var source = state.source || (runtimeInventory || {}).source || (runtimePlan || {}).source || {};
+    $('ss-srv-ref').disabled = busy || source.kind === 'github_test';
     $('ss-runtime-apply').disabled = busy || !serverManageable || state.pending_activation || state.needs_recovery ||
       !(runtimePlan && runtimePlan.can_update);
     $('ss-runtime-cancel').hidden = !state.active;
@@ -746,6 +749,12 @@
   function renderRuntimeUpdates() {
     var inv = runtimeInventory || {}, state = runtimeState || {};
     var plan = runtimePlan || state.checked_plan;
+    var source = state.source || inv.source || (plan || {}).source || {};
+    var sourceNote = $('ss-runtime-source');
+    sourceNote.hidden = source.kind !== 'github_test';
+    sourceNote.textContent = source.error || ((source.label || 'GitHub test server') + ': ' +
+      source.repo + ' @ ' + source.ref + '. Downloads come from your personal GitHub fork.');
+    sourceNote.className = source.error ? 'ss-note warn' : 'ss-note';
     var have = inv.dependencies || {}, available = plan && plan.available || {};
     var deps = available.dependencies || {};
     var rows = [];
@@ -798,6 +807,12 @@
     $('ss-runtime-note').textContent = note;
     $('ss-runtime-note').className = warning ? 'ss-note warn' : 'ss-note';
     var details = [];
+    if (inv.installed_source && inv.installed_source.repo)
+      details.push('Installed server source: ' + inv.installed_source.repo + ' @ ' +
+        (inv.installed_source.ref || '') + ' (' + (inv.installed_source.commit || inv.source_commit || 'unknown revision') + ')');
+    if (plan && plan.source && plan.source.repo)
+      details.push('Checked server source: ' + plan.source.repo + ' @ ' + plan.source.ref +
+        ' (' + (plan.source.commit || 'unknown revision') + ')');
     Object.keys(deps).sort().forEach(function (name) {
       var dep = deps[name];
       details.push(name + ': ' + (have[name] || 'not installed') + ' → ' + dep.version +
@@ -954,7 +969,7 @@
     var bits = [];
     var src = st.source || {}, inst = st.install_info || {};
     if (src.commit) {
-      bits.push('installed: ' + esc(d.repo) + ' @ ' + esc(String(src.ref || '')) +
+      bits.push('installed: ' + esc(src.repo || d.repo) + ' @ ' + esc(String(src.ref || '')) +
                 ' (' + esc(String(src.commit).slice(0, 8)) + ')');
     }
     if (inst.torch) bits.push('torch: ' + esc(inst.torch));

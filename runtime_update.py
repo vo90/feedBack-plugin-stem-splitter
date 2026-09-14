@@ -242,13 +242,16 @@ def inventory(config_dir: Path) -> dict:
         return {"installed": (root / "src" / "server.py").is_file(),
                 "generation_id": generation_id, "legacy": generation_id == "legacy",
                 "source_commit": receipt.get("source_commit") or source.get("commit"),
+                "source": ds.update_source_status(config_dir),
+                "installed_source": receipt.get("source") or source,
                 "ref": source.get("ref"), "profile_id": receipt.get("profile_id"),
                 "dependencies": versions, "audio_separator": versions.get("audio-separator"),
                 "models": models, "model_verification": "verified" if models and generation_id != "legacy" else "verification_pending",
                 "python": platform.python_version(), "platform": sys.platform,
                 "install_info": _read(root / "install.json"), "error": None}
     except Exception as exc:
-        return {"installed": False, "state": "damaged", "error": str(exc), "dependencies": {}, "models": {}}
+        return {"installed": False, "state": "damaged", "error": str(exc), "dependencies": {}, "models": {},
+                "source": ds.update_source_status(config_dir)}
 
 
 def model_presence(config_dir: Path) -> dict[str, bool]:
@@ -268,6 +271,7 @@ def model_presence(config_dir: Path) -> dict[str, bool]:
 
 def status(config_dir: Path) -> dict:
     """Recoverable transaction snapshot; no network calls or implicit recovery."""
+    import demucs_server as ds
     key = str(_base(config_dir))
     data = _read(_base(config_dir) / "update-operation.json")
     with _LOCK:
@@ -279,7 +283,8 @@ def status(config_dir: Path) -> dict:
             "cancel_requested": False, "error": None, **data}
     data.update(active=running, needs_recovery=interrupted or data.get("state") == "recovery_required",
                 pending_activation=data.get("state") == "waiting_to_activate",
-                rollback_available=bool(pointer.get("previous_generation")))
+                rollback_available=bool(pointer.get("previous_generation")),
+                source=ds.update_source_status(config_dir))
     if interrupted:
         data["phase"] = "Interrupted — recovery required"
     plan_id = data.get("plan_id")
@@ -290,7 +295,7 @@ def status(config_dir: Path) -> dict:
             # after UI reload. No manifest, asset paths, credentials or ability
             # to reapply the old transaction is exposed through this snapshot.
             data["checked_plan"] = {key: checked.get(key) for key in
-                ("plan_id", "model", "available", "dependency_graph", "server_state", "libraries_state")}
+                ("plan_id", "model", "available", "dependency_graph", "server_state", "libraries_state", "source")}
             data["checked_plan"]["can_update"] = False
     return data
 
@@ -322,9 +327,26 @@ def _json_get(url: str) -> dict:
     return value
 
 
-def _load_manifest(commit: str) -> dict:
+def _load_manifest(commit: str, repo: str | None = None) -> dict:
     import demucs_server as ds
-    return _json_get(f"https://raw.githubusercontent.com/{ds.SOURCE_REPO}/{commit}/{MANIFEST_NAME}")
+    return _json_get(f"https://raw.githubusercontent.com/{repo or ds.SOURCE_REPO}/{commit}/{MANIFEST_NAME}")
+
+
+def _assert_plan_source(config_dir: Path, plan: dict) -> dict:
+    """Bind both persisted and in-flight plans to the configured GitHub source."""
+    import demucs_server as ds
+    current = ds.update_source(config_dir, plan.get("ref"))
+    source = plan.get("source")
+    if not source:
+        if current["kind"] == "github_test":
+            raise ValueError("Server source changed; check for updates again")
+        return current  # Plans made by the clean production branch use the official repo.
+    identity = {key: value for key, value in source.items() if key != "commit"}
+    if (identity != current or _digest(identity) != plan.get("source_identity_sha256")
+            or source.get("commit") != plan.get("source_commit")
+            or not _COMMIT.fullmatch(str(source.get("commit", "")))):
+        raise ValueError("Server source changed since this plan; check for updates again")
+    return source
 
 
 def _safe_relative(value: str) -> Path:
@@ -425,15 +447,21 @@ def check_updates(config_dir: Path, ref: str | None = None, model: str = "bs_rof
         raise ValueError("Unknown runtime update component")
     result = {"schema_version": SCHEMA_VERSION, "installed": installed, "components": selected,
               "model": model, "can_update": False, "state": "unknown", "reason": None,
+              "source": installed.get("source"),
               "dependency_graph": "Resolved and validated during explicit staging; direct version checks do not certify transitive packages."}
     try:
         gpu = bool(installed.get("install_info", {}).get("gpu")) if gpu is None else bool(gpu)
         tag = str(cuda_tag or installed.get("install_info", {}).get("cuda_tag") or ds.DEFAULT_CUDA_TAG).strip()
-        ref = ds._norm_ref(ref)
-        commit = ds._resolve_commit(ref) if "server" in selected else installed.get("source_commit")
+        source = ds.update_source(config_dir, ref)
+        ref = source["ref"]
+        installed_repo = (installed.get("installed_source") or {}).get("repo") or ds.SOURCE_REPO
+        if "server" not in selected and installed_repo.lower() != source["repo"].lower():
+            raise ValueError("The installed server came from a different repository; include Server to switch sources")
+        commit = ds._source_commit(source) if "server" in selected else installed.get("source_commit")
         if not commit or not _COMMIT.fullmatch(commit):
             raise ValueError("Could not resolve an immutable server revision; nothing was installed")
-        manifest = _load_manifest(commit)
+        manifest = (_load_manifest(commit, source["repo"]) if source["kind"] == "github_test"
+                    else _load_manifest(commit))
         _validate_manifest(manifest)
         profile_id, profile = _select_profile(manifest, gpu, tag)
         model_ids = sorted(set(installed.get("models", {})) | {model})
@@ -457,10 +485,12 @@ def check_updates(config_dir: Path, ref: str | None = None, model: str = "bs_rof
                        "download_bytes": sum(asset["size"] for asset in spec["assets"])} for name, spec in models.items()]
         plan = {**result, "plan_id": uuid.uuid4().hex, "created_at": time.time(), "state": "available",
                 "can_update": True, "ref": ref, "source_commit": commit, "profile_id": profile_id,
+                "source": {**source, "commit": commit}, "source_identity_sha256": _digest(source),
                 "profile": profile, "manifest": manifest, "manifest_sha256": _digest(manifest),
                 "available": {"server": commit, "dependencies": releases, "models": model_rows},
                 "gpu": gpu, "cuda_tag": tag, "model_specs": models,
-                "server_state": "current" if installed.get("source_commit") == commit else "available",
+                "server_state": "current" if installed.get("source_commit") == commit and
+                    installed_repo.lower() == source["repo"].lower() else "available",
                 "libraries_state": "refresh_available" if "libraries" in selected else "unchanged",
                 "base_generation": installed.get("generation_id", "legacy")}
         _atomic_json(_base(config_dir) / "plans" / (plan["plan_id"] + ".json"), plan)
@@ -559,6 +589,7 @@ def _get_plan(config_dir: Path, plan_id: str) -> dict:
         raise ValueError("Update plan is missing or incompatible; check for updates again")
     if plan.get("base_generation") != _active_id(config_dir):
         raise ValueError("The active runtime changed since this plan; check for updates again")
+    _assert_plan_source(config_dir, plan)
     _validate_manifest(plan["manifest"])
     if _digest(plan["manifest"]) != plan.get("manifest_sha256"):
         raise ValueError("Update manifest changed after planning")
@@ -597,8 +628,9 @@ def _download_file(url: str, target: Path, cancel, *, size: int | None = None,
 
 def _stage_source(config_dir: Path, root: Path, plan: dict, cancel) -> None:
     import demucs_server as ds
+    planned_source = _assert_plan_source(config_dir, plan)
     archive = root / "source.zip"
-    _download_file(f"https://codeload.github.com/{ds.SOURCE_REPO}/zip/{plan['source_commit']}", archive, cancel)
+    _download_file(f"https://codeload.github.com/{planned_source['repo']}/zip/{plan['source_commit']}", archive, cancel)
     source = root / "src"
     source.mkdir()
     try:
@@ -618,8 +650,10 @@ def _stage_source(config_dir: Path, root: Path, plan: dict, cancel) -> None:
         manifest = _read(source / MANIFEST_NAME)
         if _digest(manifest) != plan["manifest_sha256"]:
             raise ValueError("Downloaded source does not match the planned compatibility manifest")
-        _atomic_json(root / "source.json", {"repo": ds.SOURCE_REPO, "ref": plan["ref"],
-                                           "commit": plan["source_commit"], "installed_at": time.time()})
+        _assert_plan_source(config_dir, plan)
+        _atomic_json(root / "source.json", {**planned_source, "ref": plan["ref"],
+                                           "commit": plan["source_commit"], "archive_sha256": _hash_file(archive, cancel),
+                                           "installed_at": time.time()})
     finally:
         archive.unlink(missing_ok=True)
 
@@ -901,6 +935,7 @@ def _stage_candidate(config_dir: Path, plan: dict, cancel, callback) -> Path:
     root.mkdir(parents=True, exist_ok=False)
     _persist(config_dir, generation_id=identity, previous_generation=_active_id(config_dir), plan_id=plan["plan_id"])
     receipt = {"schema_version": SCHEMA_VERSION, "generation_id": identity, "source_commit": plan["source_commit"],
+               "source": plan.get("source"),
                "profile_id": plan["profile_id"], "manifest_sha256": plan["manifest_sha256"],
                "created_at": time.time(), "owner": "stem_splitter", "validated": False,
                "prepared": False, "python": platform.python_version(), "platform": sys.platform,
@@ -908,6 +943,7 @@ def _stage_candidate(config_dir: Path, plan: dict, cancel, callback) -> Path:
     _atomic_json(root / "receipt.json", receipt)
     _event(config_dir, callback, "downloading", 0.04, "Downloading the exact server revision")
     _stage_source(config_dir, root, plan, cancel)
+    receipt["source"] = _read(root / "source.json")
     cancel()
     if "libraries" in plan["components"]:
         _event(config_dir, callback, "installing", 0.12, "Resolving compatible dependencies in a separate runtime")
@@ -1010,6 +1046,8 @@ def _activate(config_dir: Path, root: Path, plan: dict, cancel, callback,
               port: int, device: str, model: str, before_activate, start_after: bool,
               *, rolling_back: bool = False) -> dict:
     import demucs_server as ds
+    if not rolling_back:
+        _assert_plan_source(config_dir, plan)
     previous_id = _active_id(config_dir)
     target_id = "legacy" if root == _base(config_dir) else root.name
     old_pointer_path = _base(config_dir) / "active.json"
@@ -1026,6 +1064,8 @@ def _activate(config_dir: Path, root: Path, plan: dict, cancel, callback,
     if before_activate:
         before_activate()
     cancel()
+    if not rolling_back:
+        _assert_plan_source(config_dir, plan)
     if was_running and not _managed_identity(config_dir, port, previous_id):
         _event(config_dir, callback, "waiting_to_activate", .78,
                "Candidate ready. Stop the existing server, then activate or start it to finish the update")
@@ -1053,6 +1093,8 @@ def _activate(config_dir: Path, root: Path, plan: dict, cancel, callback,
             _atomic_json(root / "receipt.json", receipt)
         cancel()
         _event(config_dir, callback, "activating", .93, "Activating the verified runtime")
+        if not rolling_back:
+            _assert_plan_source(config_dir, plan)
         previous_exists = (_generation(config_dir, previous_id) / "src" / "server.py").is_file()
         previous = previous_id if previous_exists and previous_id != target_id else (
             old_pointer.get("previous_generation") if old_pointer else None)

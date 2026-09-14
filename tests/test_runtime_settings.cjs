@@ -92,6 +92,31 @@ test('opening settings reads versions without checking the internet or installin
   assert.ok(!ui.requests.some(r => /runtime\/(check|update)|server\/(update|install)$/.test(r.endpoint)));
 });
 
+test('GitHub test source is visible before checking and locks only the launcher-selected ref', async () => {
+  const source = {kind: 'github_test', repo: 'vo90/feedBack-demucs-server', ref: 'review/managed-runtime',
+    label: 'Personal GitHub test server'};
+  const ui = harness({'/server/runtime/status': {state: 'idle', active: false, source},
+    '/server/runtime/inventory': {installed: true, source,
+      installed_source: {repo: 'got-feedBack/feedBack-demucs-server', ref: 'main', commit: 'a'.repeat(40)}}});
+  await ui.flush();
+  assert.equal(ui.nodes.get('ss-runtime-source').hidden, false);
+  assert.match(ui.nodes.get('ss-runtime-source').textContent, /vo90\/feedBack-demucs-server @ review\/managed-runtime/);
+  assert.equal(ui.nodes.get('ss-srv-ref').disabled, true);
+  assert.equal(ui.nodes.get('ss-srv-ref').value, '');
+  assert.match(ui.nodes.get('ss-runtime-details').textContent, /Installed server source: got-feedBack/);
+  assert.ok(!ui.requests.some(r => /runtime\/(check|update)$/.test(r.endpoint)));
+});
+
+test('configured official source wins over an old checked GitHub test plan', async () => {
+  const ui = harness({'/server/runtime/status': {state: 'waiting_to_activate', active: false,
+    source: {kind: 'github', repo: 'got-feedBack/feedBack-demucs-server', ref: 'main'},
+    checked_plan: {source: {kind: 'github_test', repo: 'vo90/feedBack-demucs-server', ref: 'review/managed-runtime'}}}});
+  await ui.flush();
+  assert.equal(ui.nodes.get('ss-runtime-source').hidden, true);
+  assert.equal(ui.nodes.get('ss-srv-ref').disabled, false);
+  assert.match(ui.nodes.get('ss-runtime-details').textContent, /Checked server source: vo90/);
+});
+
 test('checking exposes versions but installation requires the separate apply action', async () => {
   const ui = harness();
   await ui.flush();

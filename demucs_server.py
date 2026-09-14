@@ -91,7 +91,10 @@ SOURCE_REPO = "got-feedBack/feedBack-demucs-server"
 # zip is a moving target (the same click could install different code next week).
 # Default ref. Overridable per-install from the settings' Advanced section (and by
 # env for headless/CI use). Resolved to an immutable commit before download.
-DEFAULT_SOURCE_REF = os.environ.get("STEM_SPLITTER_SERVER_REF", "main")
+# A test launch's forced ref belongs only to its scoped profile, even after the
+# override is removed in this process. Preserve ordinary official ref overrides.
+DEFAULT_SOURCE_REF = ("main" if os.environ.get("FEEDBACK_STEM_TEST_REPO", "").strip()
+                      else os.environ.get("STEM_SPLITTER_SERVER_REF", "main"))
 SOURCE_REF = DEFAULT_SOURCE_REF   # back-compat alias
 # The only files the server actually needs to run.
 SOURCE_FILES = ("server.py", "run_demucs.py", "run_roformer.py", "requirements.txt")
@@ -737,6 +740,46 @@ def _norm_ref(ref: str | None) -> str:
     return (ref or DEFAULT_SOURCE_REF).strip() or DEFAULT_SOURCE_REF
 
 
+def update_source(config_dir: Path, ref: str | None = None) -> dict:
+    """TEST BRANCH ONLY: select a GitHub fork for one explicitly scoped profile.
+
+    Never change SOURCE_REPO or the process environment. In particular, a test
+    launch's forced ref must not affect another profile in the same process.
+    """
+    test_repo = os.environ.get("FEEDBACK_STEM_TEST_REPO", "").strip()
+    if not test_repo:
+        return {"kind": "github", "repo": SOURCE_REPO, "ref": _norm_ref(ref),
+                "label": "Official GitHub server"}
+    scope = os.environ.get("FEEDBACK_STEM_TEST_CONFIG_DIR", "").strip()
+    if not scope or not Path(scope).is_absolute():
+        raise ValueError("GitHub test source requires an absolute FEEDBACK_STEM_TEST_CONFIG_DIR")
+    if Path(config_dir).resolve() != Path(scope).resolve():
+        return {"kind": "github", "repo": SOURCE_REPO, "ref": (ref or "main").strip() or "main",
+                "label": "Official GitHub server"}
+    if test_repo != "vo90/feedBack-demucs-server":
+        raise ValueError("This test branch only supports the vo90/feedBack-demucs-server GitHub fork")
+    test_ref = os.environ.get("STEM_SPLITTER_SERVER_REF", "").strip()
+    if not test_ref or len(test_ref) > 200 or not re.fullmatch(r"[A-Za-z0-9_./-]+", test_ref):
+        raise ValueError("GitHub test source requires a valid STEM_SPLITTER_SERVER_REF")
+    return {"kind": "github_test", "repo": test_repo, "ref": test_ref,
+            "scope": str(Path(scope).resolve()), "label": "Personal GitHub test server"}
+
+
+def update_source_status(config_dir: Path) -> dict:
+    """Expose an invalid test setup without hiding the installed inventory."""
+    try:
+        return update_source(config_dir)
+    except (OSError, ValueError) as exc:
+        return {"kind": "github_test", "label": "GitHub test source needs configuration",
+                "error": str(exc)}
+
+
+def _source_commit(source: dict) -> str | None:
+    # Keep the longstanding official helper call compatible with existing hosts.
+    return (_resolve_commit(source["ref"], source["repo"]) if source["kind"] == "github_test"
+            else _resolve_commit(source["ref"]))
+
+
 def source_meta(config_dir: Path) -> dict:
     """What source is actually installed (ref + commit)."""
     try:
@@ -754,15 +797,16 @@ def check_update(config_dir: Path, ref: str | None = None) -> dict:
     """
     if not installed(config_dir):
         return {"installed": False, "update_available": False}
-    ref = _norm_ref(ref)
+    source = update_source(config_dir, ref)
+    ref = source["ref"]
     meta = source_meta(config_dir)
     have = str(meta.get("commit") or "")
-    latest = _resolve_commit(ref)
+    latest = _source_commit(source)
     if not latest:
         # `unknown` on every path that reports an install: a caller reading it to decide whether
         # to offer an update to an install with no recorded commit must get the same signal here
         # as everywhere else, not a missing key.
-        return {"installed": True, "ref": ref, "commit": have, "latest": None,
+        return {"installed": True, "ref": ref, "commit": have, "latest": None, "source": source,
                 "update_available": False, "unknown": not have,
                 "reason": "Could not reach GitHub to check for a newer revision."}
     return {
@@ -770,7 +814,9 @@ def check_update(config_dir: Path, ref: str | None = None) -> dict:
         "ref": ref,
         "commit": have,
         "latest": latest,
-        "update_available": bool(have) and have != latest,
+        "source": source,
+        "update_available": bool(have) and (have != latest or
+            str(meta.get("repo") or SOURCE_REPO).lower() != source["repo"].lower()),
         # No recorded commit means the install predates commit-pinning: we cannot prove it's
         # current, so offer the update rather than claiming it's fine.
         "unknown": not have,
@@ -878,7 +924,7 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
     if not installed(config_dir):
         raise RuntimeError("the server isn't installed, so there is nothing to update")
 
-    ref = _norm_ref(ref)      # exactly as check_update() does it, or "check" and "apply" differ
+    ref = update_source(config_dir, ref)["ref"]
 
     # BEFORE anything is touched, and before the server is stopped: no snapshot, no update. An
     # in-place overwrite we cannot undo is precisely the failure the snapshot exists to prevent,
@@ -1023,18 +1069,19 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
     return st
 
 
-def _resolve_commit(ref: str) -> str | None:
+def _resolve_commit(ref: str, repo: str = SOURCE_REPO) -> str | None:
     """Resolve a ref to an immutable commit SHA. None if GitHub can't be reached
     (we then fall back to the branch archive rather than failing the install)."""
     import requests
+    from urllib.parse import quote
     try:
-        r = requests.get(f"https://api.github.com/repos/{SOURCE_REPO}/commits/{ref}",
+        r = requests.get(f"https://api.github.com/repos/{repo}/commits/{quote(ref, safe='')}",
                          headers={"Accept": "application/vnd.github.sha"}, timeout=30)
         if r.status_code == 200 and r.text.strip():
             return r.text.strip()
     except Exception as e:
         log.warning("stem_splitter: could not resolve %s@%s to a commit: %s",
-                    SOURCE_REPO, ref, e)
+                    repo, ref, e)
     return None
 
 
@@ -1051,10 +1098,13 @@ def download_source(config_dir: Path, ref: str | None = None,
     sdir = src_dir(config_dir)
     sdir.mkdir(parents=True, exist_ok=True)
 
-    ref = _norm_ref(ref)
-    commit = _resolve_commit(ref)
+    source = update_source(config_dir, ref)
+    ref = source["ref"]
+    commit = _source_commit(source)
+    if source["kind"] == "github_test" and not re.fullmatch(r"[a-fA-F0-9]{40}", commit or ""):
+        raise ValueError("Could not resolve an immutable GitHub test server revision")
     archive = commit or ref
-    url = f"https://codeload.github.com/{SOURCE_REPO}/zip/{archive}"
+    url = f"https://codeload.github.com/{source['repo']}/zip/{archive}"
     _emit(progress_cb,
           f"Downloading server source {ref}"
           + (f" @ {commit[:8]}" if commit else " (unpinned - could not resolve a commit)"),
@@ -1079,7 +1129,7 @@ def download_source(config_dir: Path, ref: str | None = None,
 
     try:
         _source_meta_file(config_dir).write_text(
-            json.dumps({"repo": SOURCE_REPO, "ref": ref, "commit": commit,
+            json.dumps({**source, "commit": commit,
                         "installed_at": time.time()}, indent=2), encoding="utf-8")
     except OSError as e:
         log.warning("stem_splitter: could not record installed source revision: %s", e)
@@ -1723,6 +1773,10 @@ def _server_env(config_dir: Path) -> dict:
     ffmpeg (a hard prerequisite of the server) is on PATH by reusing the one the
     feedBack app already bundles."""
     env = dict(os.environ)
+    # Source selection belongs to this plugin host, never the downloaded server.
+    for key in ("FEEDBACK_STEM_TEST_REPO", "FEEDBACK_STEM_TEST_CONFIG_DIR",
+                "FEEDBACK_STEM_TEST_SOURCE", "STEM_SPLITTER_SERVER_REF"):
+        env.pop(key, None)
     # The app points PYTHONPATH at its own tree (feedback/, feedback/lib), which
     # would leak its modules - including a *different* server.py - into the demucs
     # server's import path. The launcher sets up sys.path itself, so drop it.
@@ -2416,6 +2470,7 @@ def server_status(config_dir: Path, model: str = DEFAULT_MODEL,
         # generation model. Each catalog entry has its own verified asset set.
         if model not in present:
             present[model] = False
+    configured_source = update_source_status(config_dir)
     return {
         "installed": installed(config_dir),
         "running": running,
@@ -2438,8 +2493,8 @@ def server_status(config_dir: Path, model: str = DEFAULT_MODEL,
         "gpu_detected": detect_nvidia_gpu(),
         "gpu_build": bool(install_info(config_dir).get("gpu")),
         "install_info": install_info(config_dir),   # {gpu, torch, cuda_tag}
-        "defaults": {"ref": DEFAULT_SOURCE_REF, "cuda_tag": DEFAULT_CUDA_TAG,
-                     "cuda_tags": CUDA_TAGS, "repo": SOURCE_REPO},
+        "defaults": {"ref": configured_source.get("ref", DEFAULT_SOURCE_REF), "cuda_tag": DEFAULT_CUDA_TAG,
+                     "cuda_tags": CUDA_TAGS, "repo": configured_source.get("repo", SOURCE_REPO)},
         "manageable": manageable,
         "manage_reason": manage_reason,
         # Non-blocking note (e.g. "you're in a container") shown alongside the controls.

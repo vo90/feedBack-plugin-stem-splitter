@@ -227,3 +227,37 @@ Target Host: feedBack desktop with the v3 UI (`window.feedBack.uiVersion === 'v3
 ## License
 
 **AGPL-3.0-only** — the same license as the feedBack app. See [LICENSE](LICENSE).
+
+## Personal GitHub integration test overlay
+
+This section applies only to `test/integration-stem-github`. The overlay is
+separate from the clean managed-updater and status pull-request branches.
+
+A dedicated launcher may set these variables **only in the game child process**:
+
+```text
+FEEDBACK_STEM_TEST_REPO=vo90/feedBack-demucs-server
+FEEDBACK_STEM_TEST_CONFIG_DIR=<absolute config directory of the isolated test profile>
+STEM_SPLITTER_SERVER_REF=review/managed-runtime
+```
+
+The matching profile checks and downloads the personal GitHub fork through the
+normal GitHub API, raw manifest, and commit archive endpoints. No local source
+bundle is used. Settings identifies the configured fork and ref before checking;
+installed and checked source revisions remain separately visible. The revision
+field is locked while this launcher selects the test ref.
+
+Each checked plan binds the repository, ref, profile scope, and full commit.
+Changing the source requires checking again, including after restart or before
+activating a prepared update. Downloaded source must match the checked manifest;
+receipts record its origin and archive SHA-256. Existing dependency, model hash,
+device, inference, activation, and rollback checks still apply. A failed or
+unresolvable test source never falls back to an official download.
+
+The override permits only the named personal fork. Other profiles ignore the
+test repository and its forced default ref. Without the override, normal official
+source selection remains in effect; previously installed origin is still recorded.
+The variables are not forwarded to downloaded server subprocesses and do not
+change user or machine environment settings. Model-only or library-only updates
+require the installed server to come from the selected repository; include Server
+when switching repositories.
