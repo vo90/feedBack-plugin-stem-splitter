@@ -844,11 +844,9 @@ def setup(app: FastAPI, context: dict) -> None:
 
     @app.get(f"{P}/server_status")
     def get_server_status():
-        # The model the server was actually started with — see server_status(). Asking
-        # /health about DEFAULT_MODEL when the user configured another one leaves
-        # models_ready false on a server that is fully warm.
-        _p, _d, model = _server_opts()
-        return demucs_server.server_status(mgr.config_dir, model=model)
+        # Show the saved choices separately from the running server's actual mode.
+        _p, device, model = _server_opts()
+        return demucs_server.server_status(mgr.config_dir, model=model, requested_device=device)
 
     @app.get(f"{P}/server/health")
     def get_server_health():

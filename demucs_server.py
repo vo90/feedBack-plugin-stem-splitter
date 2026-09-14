@@ -2266,15 +2266,116 @@ def _model_ready(warmup: dict, model: str) -> bool:
     return str(v) in ("ready", "skipped")
 
 
-def server_status(config_dir: Path, model: str = DEFAULT_MODEL) -> dict:
+def _verified_status_model(health: dict, model: str) -> bool | None:
+    """Trust only the live server's recognized verification contract, not file sizes."""
+    runtime = health.get("runtime")
+    if not isinstance(runtime, dict) or type(runtime.get("schema_version")) is not int:
+        return None
+    if (runtime["schema_version"] != 1 or runtime.get("managed") is not True
+            or not isinstance(runtime.get("capabilities"), list)
+            or "verified_models_v1" not in runtime["capabilities"]):
+        return None
+    inventory = runtime.get("models")
+    if not isinstance(inventory, dict):
+        return None
+    if model not in inventory:
+        return False
+    spec = inventory[model]
+    if not isinstance(spec, dict) or type(spec.get("verified")) is not bool:
+        return None
+    return spec["verified"]
+
+
+def _model_presentation(raw, present: bool, verified: bool | None, *, running: bool,
+                        not_selected: bool = False) -> dict:
+    warmup = raw.strip().lower() if isinstance(raw, str) else None
+    result = {"state": "unknown", "label": "Status not reported", "present": bool(present),
+              "verified": verified, "warmup_state": warmup, "ready": False}
+    if not running:
+        result.update(state="stopped", label="Server stopped")
+    elif warmup and (warmup.startswith("failed") or warmup in ("error", "unavailable")):
+        detail = raw.partition(":")[2].strip() if isinstance(raw, str) else ""
+        result.update(state="failed", label="Preparation failed",
+                      detail=detail or "Server reported a failure without an error message.")
+    elif not_selected:
+        result.update(state="not_selected", label="Not selected")
+    elif verified is False:
+        result.update(state="missing", label="Model not installed or verified")
+    elif warmup in ("ready", "loaded", "complete", "completed"):
+        result.update(state="ready", label="Ready to use", ready=True)
+    elif warmup in ("pending", "loading", "downloading", "warming", "initializing", "queued"):
+        # Older servers say downloading for both loading cached weights and
+        # fetching them. Presence alone cannot establish network activity.
+        result.update(state="loading", label="Loading model…" if present or verified else "Preparing model…")
+    elif warmup in (None, "skipped") and verified is True:
+        result.update(state="on_demand", label="Installed and verified — loads when needed", ready=True)
+    elif warmup == "evicted":
+        result.update(state="on_demand", label="Starts when needed", ready=True)
+    elif warmup == "skipped":
+        result.update(state="on_demand", label="Not checked at startup", ready=True)
+    return result
+
+
+def _demucs_alias_matches(health: dict, model: str) -> bool:
+    if health.get("demucs_model") != model or "roformer" in model.lower():
+        return False
+    runtime = health.get("runtime")
+    models = runtime.get("models") if isinstance(runtime, dict) else None
+    spec = models.get(model) if isinstance(models, dict) else None
+    engine = spec.get("engine") if isinstance(spec, dict) else None
+    # Legacy Demucs model names are extensible (htdemucs_ft, mdx_extra, etc.).
+    # Match the reported name without borrowing a known Roformer engine's status.
+    return engine not in {"audio-separator", "roformer"} if isinstance(engine, str) else True
+
+
+def _status_presentation(health: dict, present: dict, model: str, state: dict,
+                         running: bool, requested_device: str | None) -> dict:
+    """Pure display projection of data already gathered by server_status."""
+    warmup = health.get("warmup")
+    warmup = warmup if isinstance(warmup, dict) else {}
+    raw = warmup.get(model)
+    alias_used = raw is None and _demucs_alias_matches(health, model)
+    if alias_used:
+        raw = warmup.get("demucs")
+    selected = _model_presentation(raw, present.get(model, False), _verified_status_model(health, model), running=running)
+    features = {}
+    for name in sorted(key for key in set(warmup) | set(present) if isinstance(key, str)):
+        if name == model or (name == "demucs" and alias_used):
+            continue
+        feature_raw = warmup.get(name)
+        if name == "whisperx_aligners" and isinstance(feature_raw, dict) and feature_raw:
+            # Health reports aligners per language. Project one level only so a
+            # failed language and another still loading remain independently visible.
+            for language, language_state in feature_raw.items():
+                if isinstance(language, str):
+                    features[f"{name}:{language}"] = _model_presentation(language_state, False, None, running=running)
+            continue
+        alternate = name in {"demucs", "bs_roformer_sw", "htdemucs", "htdemucs_6s"}
+        features[name] = _model_presentation(feature_raw, present.get(name, False), None,
+                                              running=running, not_selected=alternate)
+    def normalize(value):
+        return str(value or "auto").strip().lower() or "auto"
+    started = normalize(state["device"]) if "device" in state else None
+    requested = normalize(requested_device) if requested_device is not None else (started or "auto")
+    effective = health.get("device")
+    effective = effective.strip().lower() if running and isinstance(effective, str) and effective.strip() else None
+    restart = running and started is not None and requested != started
+    if running and started is None and effective and requested != "auto":
+        restart = effective != requested and not (requested == "cuda" and effective.startswith("cuda:"))
+    return {"selected_model": model, "model": selected, "features": features,
+            "requested_device": requested, "started_device": started,
+            "effective_device": effective, "restart_required": bool(restart),
+            "settled": all(item["state"] not in {"loading", "downloading"} for item in [selected, *features.values()])}
+
+
+def server_status(config_dir: Path, model: str = DEFAULT_MODEL,
+                  requested_device: str | None = None) -> dict:
     """Offline, cheap, and polled every few seconds.
 
-    `model` is the model the server was actually STARTED with. It defaults to DEFAULT_MODEL
-    for callers that don't know (nothing here can read the plugin's settings), but the route
-    passes the configured one — otherwise a user on a non-default model warms it fully and
-    models_ready stays false forever, because we'd be asking /health about a model the server
-    was never told to warm. The UI would never say "Warm · ready to split" and would keep
-    polling a server that is, in fact, ready.
+    `model` and `requested_device` are the saved choices passed by the route.
+    Additive presentation data distinguishes that request, the recorded launch
+    mode, actual health-reported device, and verified versus merely present files.
+    Existing public readiness fields retain their historical semantics.
     """
     st = _read_state(config_dir)
     port = _as_port(st.get("port"), DEFAULT_PORT)
@@ -2326,6 +2427,7 @@ def server_status(config_dir: Path, model: str = DEFAULT_MODEL) -> dict:
         "managed_generation": managed_generation,
         "models_present": present,
         "models_ready": models_ready,
+        "presentation": _status_presentation(health, present, model, st, running, requested_device),
         "server_dir": str(server_dir(config_dir)),
         "disk_bytes": _server_disk_bytes(config_dir),
         # False on deployments where a plugin-managed server makes no sense

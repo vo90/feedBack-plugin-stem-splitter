@@ -175,3 +175,10 @@ def test_managed_split_never_downloads_unrelated_lyrics_models(runtime_api):
             mock.patch.object(mgr, "resolve_split_engine", return_value=("remote", "")), \
             mock.patch.object(runtime_update, "inventory", return_value={"legacy": False}):
         assert mgr.needs_server_setup("split") is None
+
+
+def test_status_passes_saved_device_and_selected_model_to_presentation(runtime_api):
+    client, _, cfg = runtime_api
+    with mock.patch.object(routes.demucs_server, "server_status", return_value={"presentation": {}}) as status:
+        assert client.get("/api/plugins/stem_splitter/server_status").status_code == 200
+    status.assert_called_once_with(cfg, model="htdemucs_6s", requested_device="cpu")

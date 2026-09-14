@@ -79,6 +79,19 @@ machine, so you don't have to stand one up yourself.
 | **Test status** | Probes `/health` — device, GPU, per-model warmup state. |
 | **Uninstall server** | Removes the source, its dependencies **and its downloaded weights**. |
 
+**Run on** selects CPU, NVIDIA GPU or Auto for the next server start. If it
+differs from the running server's selection, Settings asks you to restart the
+server. **Using CPU** / **Using NVIDIA GPU** reports its actual execution device.
+**GPU support installed** describes the libraries and can appear alongside
+**Using CPU**.
+
+The selected separator has its own status. **Installed and verified** means the
+managed server verified the model files; **Starts when needed** means startup
+preparation was intentionally skipped. **Ready to use** does not mean the model
+stays loaded in memory between jobs. Older servers that do not supply verification
+evidence show **Not checked at startup**. Optional transcription and pitch features
+appear under details, so their state does not imply the selected separator failed.
+
 Status includes component versions, download/install progress, errors, pending activation
 and interrupted-operation recovery. A stopped server stays stopped after an update.
 For a running server that supports coordinated draining, new work pauses while current
@@ -109,8 +122,8 @@ in the background on launch. This never slows startup and never downloads:
 
 - verified managed generation → start without downloading auxiliary transcription
   models; the selected stem model was already executed during installation
-- legacy weights already on disk → start **with warmup** (a RAM load — the server comes up
-  warm, so the first split is fast)
+- legacy weights already on disk → start **with warmup** to check model preparation;
+  separation workers load the selected model again when a job starts
 - weights absent → start with `--skip-warmup`, so launching can't trigger the ~5 GB fetch
 
 **Use for the whole app** additionally writes the local URL into the app's
@@ -119,11 +132,14 @@ does (and your own `demucs_server_url` is left untouched).
 
 ### GPU (CUDA)
 
-Use **GPU (CUDA)** for a supported NVIDIA installation or leave it off for CPU
-execution. The updater uses the same compatibility and execution checks across
+Select **Install NVIDIA GPU support** for a supported NVIDIA installation. This
+controls the libraries installed by the next installation or update; **Run on**
+controls execution separately. With the updated server, GPU libraries can run
+CPU separation without reinstalling dependencies or models. The updater uses
+the same compatibility and execution checks across
 GPU models; there is no RTX 4080-specific path. It:
 
-- **detects an NVIDIA GPU** (via `nvidia-smi`) and ticks **Use GPU (CUDA)** by default
+- **detects an NVIDIA GPU** (via `nvidia-smi`) and ticks **Install NVIDIA GPU support** by default
   when one is present;
 - installs the **CUDA torch build** (`torch==2.8.0+cu128` from PyTorch's index) — pinned
   inside the same pip resolve as the profile's dependencies, so it cannot introduce a
