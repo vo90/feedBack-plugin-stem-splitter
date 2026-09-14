@@ -31,6 +31,7 @@ import realign
 _OPT_BODY = Body(None)
 
 INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
+SEPARATION_SERVICE_ID = "stem_splitter.separation.v1"
 _BROADCAST_MIN_INTERVAL = 0.15  # s — throttle progress spam
 
 
@@ -653,6 +654,57 @@ class JobManager:
         }
 
 
+class SeparationServiceV1:
+    """Versioned in-process API for temporary, non-pak separation.
+
+    Consumers own the output directory and can delete it to discard every
+    model output. They never need Stem Splitter's server credentials or private
+    settings, and this service itself never modifies a feedpak.
+    """
+
+    id = SEPARATION_SERVICE_ID
+    supported_stems = tuple(INSTRUMENT_STEM_IDS)
+
+    def __init__(self, manager: JobManager):
+        self.manager = manager
+
+    def status(self) -> dict:
+        engine, reason = self.manager.resolve_split_engine()
+        needs = self.manager.needs_server_setup("split") if engine else None
+        return {
+            "available": bool(engine),
+            "ready": bool(engine) and not needs,
+            "engine": engine,
+            "reason": reason,
+            "needs_setup": needs,
+            "supported_stems": list(self.supported_stems),
+        }
+
+    def separate(self, mix: Path, out_dir: Path, stems: tuple[str, ...],
+                 progress_cb=None, cancel_cb=None) -> dict[str, Path]:
+        engine, _reason = self.manager.resolve_split_engine()
+        if not engine:
+            raise RuntimeError(
+                "no stem-separation engine is available; start the local server "
+                "or configure Stem Splitter first"
+            )
+        needs = self.manager.needs_server_setup("split")
+        if needs:
+            raise RuntimeError(needs.get("message") or "the stem-separation model is not ready")
+
+        import split_stems
+        settings = self.manager.read_settings()
+        return split_stems.separate_audio(
+            Path(mix), Path(out_dir), engine=engine,
+            model=(settings.get("remote_model") if engine != "demucs" else None),
+            server_url=self.manager._server_url(), api_key=self.manager._api_key(),
+            engine_dir=str(engine_install.engine_dir(self.manager.config_dir)),
+            models_dir=str(engine_install.models_dir(self.manager.config_dir)),
+            stems=tuple(stems), progress_cb=progress_cb, cancel_cb=cancel_cb,
+            ephemeral=True,
+        )
+
+
 def setup(app: FastAPI, context: dict) -> None:
     # Finish any uninstall that was deferred last session because the engine's
     # native DLLs were locked. Do this first, before anything can import from the
@@ -668,6 +720,15 @@ def setup(app: FastAPI, context: dict) -> None:
 
     mgr = JobManager(app, context)
     log = mgr.log
+
+    # Versioned, narrow cross-plugin service. Practice Mix Exporter loads
+    # alphabetically before this plugin, so consumers resolve the registry at
+    # request time rather than relying on setup order.
+    services = getattr(app.state, "feedback_plugin_services", None)
+    if not isinstance(services, dict):
+        services = {}
+        app.state.feedback_plugin_services = services
+    services[SEPARATION_SERVICE_ID] = SeparationServiceV1(mgr)
 
     try:
         # setup() is marshalled onto the event-loop thread by the host, so the

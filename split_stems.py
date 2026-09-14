@@ -235,7 +235,8 @@ def _redact_url(url: str) -> str:
     return f"{u.scheme}://{u.netloc}{u.path}" + ("?…" if u.query else "")
 
 
-def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float):
+def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float,
+                *, stream: bool = False):
     """GET `url`, following redirects BY HAND so the API key can never ride off-origin.
 
     ``requests`` drops the ``Authorization`` header on a cross-host redirect, but it
@@ -259,8 +260,10 @@ def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float)
         if headers and hop_headers is None:
             log.warning("stem_splitter: %s is off-origin from %s - requesting without "
                         "the API key", _redact_url(url), server_url)
-        resp = requests.get(url, headers=hop_headers, timeout=timeout,
-                            allow_redirects=False)
+        resp = requests.get(
+            url, headers=hop_headers, timeout=timeout,
+            allow_redirects=False, stream=stream,
+        )
         location = resp.headers.get("location") if resp.status_code in _REDIRECT_CODES \
             else None
         if not location:
@@ -296,9 +299,43 @@ def _err_body(resp) -> str:
     return text[:_MAX_ERR_BODY].strip() + f"\n… [truncated, {len(text)} chars total]"
 
 
+def _cleanup_remote_cache(requests, server_url: str, job_id: str,
+                          headers: dict[str, str]) -> None:
+    """Best-effort deletion for a completed ephemeral server job.
+
+    Starlette can finish sending a downloaded stem a fraction after the client
+    receives its final byte.  On Windows that short-lived open handle can make
+    the server's first ``rmtree`` leave some FLAC files behind.  The endpoint is
+    intentionally idempotent, so one delayed retry closes that race without
+    making a successful practice-mix export depend on cleanup succeeding.
+    """
+    cleanup_url = f"{server_url}/cache/{job_id}"
+    cleanup_headers = headers if _same_origin(cleanup_url, server_url) else None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(0.25)
+        try:
+            response = requests.delete(
+                cleanup_url, headers=cleanup_headers, timeout=30,
+                allow_redirects=False,
+            )
+            status_code = response.status_code
+            response.close()
+            if status_code == 404:
+                return
+            if status_code != 200:
+                log.warning(
+                    "stem_splitter: temporary server cache cleanup failed (HTTP %s)",
+                    status_code,
+                )
+        except Exception as exc:
+            log.warning("stem_splitter: temporary server cache cleanup failed: %s", exc)
+
+
 def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
                 api_key: str | None, stems: tuple[str, ...],
-                progress_cb: ProgressCB, cancel_cb: CancelCB = None) -> Path:
+                progress_cb: ProgressCB, cancel_cb: CancelCB = None,
+                cleanup_cache: bool = False) -> Path:
     """POST the mix to ``{server_url}/separate`` and download the stems."""
     import requests
 
@@ -306,7 +343,18 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
     if progress_cb:
         progress_cb(0.10, f"Uploading to split server ({server_url})")
 
-    content_type = "audio/wav" if mix.suffix.lower() == ".wav" else "audio/ogg"
+    # Preserve the real media type. The old wav/else-ogg shortcut mislabeled
+    # FLAC and MP3 full mixes as Ogg. Some servers sniffed around the mistake,
+    # but an ephemeral practice-mix split should also work for spec-valid packs
+    # whose `full` stem is not Vorbis.
+    content_type = {
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".flac": "audio/flac",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+    }.get(mix.suffix.lower(), "application/octet-stream")
     params: dict[str, str] = {"model": model}
     if stems:
         params["stems"] = ",".join(stems)
@@ -361,10 +409,13 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             resp.close()
         raise RuntimeError(f"split server error ({code}): {body}")
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    finally:
+        resp.close()
+    job_id = data.get("job_id")
     stem_urls = data.get("stems") or {}
-    if not stem_urls and data.get("job_id"):
-        job_id = data["job_id"]
+    if not stem_urls and job_id:
         # Wall-clock deadline, not an iteration count: the server allows a roformer
         # job up to 30 min, so the old 120x5s (=10 min) cap failed long splits that
         # were actually still running.
@@ -377,18 +428,21 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             # so the server must not be able to bounce it to a host of its choosing.
             jresp, _ = _get_authed(f"{server_url}/jobs/{job_id}", server_url,
                                    headers, timeout=30)
-            if jresp.status_code != 200:
-                # A 404/500/HTML error page would blow up .json() with an opaque
-                # decode error; surface what actually happened instead.
-                raise RuntimeError(
-                    f"split server job poll failed ({jresp.status_code}): "
-                    f"{_err_body(jresp)}")
             try:
-                jr = jresp.json()
-            except ValueError as e:
-                raise RuntimeError(
-                    f"split server returned a non-JSON job response: {_err_body(jresp)}"
-                ) from e
+                if jresp.status_code != 200:
+                    # A 404/500/HTML error page would blow up .json() with an opaque
+                    # decode error; surface what actually happened instead.
+                    raise RuntimeError(
+                        f"split server job poll failed ({jresp.status_code}): "
+                        f"{_err_body(jresp)}")
+                try:
+                    jr = jresp.json()
+                except ValueError as e:
+                    raise RuntimeError(
+                        f"split server returned a non-JSON job response: {_err_body(jresp)}"
+                    ) from e
+            finally:
+                jresp.close()
             status = jr.get("status")
             if status == "complete":
                 stem_urls = jr.get("stems") or {}
@@ -407,31 +461,86 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
 
     result_dir = out_dir / "remote_stems"
     result_dir.mkdir(parents=True, exist_ok=True)
-    for name, url in stem_urls.items():
+    download_items = list(stem_urls.items())
+    requested = {str(stem).strip().lower() for stem in stems if str(stem).strip()}
+    if requested:
+        normalized = {
+            name: _normalize_stem_id(str(name))
+            for name, _url in download_items
+        }
+        # Only filter when every requested stem is recognisable in the server
+        # response. An older/custom server may use unfamiliar labels; in that
+        # case downloading all outputs preserves the previous compatibility
+        # behavior and lets the canonical collector make the final decision.
+        if requested.issubset({stem for stem in normalized.values() if stem}):
+            download_items = [
+                (name, url) for name, url in download_items
+                if normalized.get(name) in requested
+            ]
+
+    total_downloads = max(1, len(download_items))
+    for download_index, (name, url) in enumerate(download_items):
+        if cancel_cb:
+            cancel_cb()
+        if progress_cb:
+            progress_cb(
+                0.55 + 0.18 * (download_index / total_downloads),
+                f"Downloading {name}",
+            )
         if isinstance(url, str) and url.startswith("/"):
             url = f"{server_url}{url}"
         # The stem URLs come from the server's RESPONSE, and each hop of a redirect chain
         # is attacker-choosable from there. _get_authed re-checks the origin per hop and
         # only attaches the key while we're still talking to the configured server.
-        sr, final_url = _get_authed(url, server_url, headers, timeout=180)
-        # Skipping a failed download silently produced a pak that LOOKS split but is
-        # missing stems, and the job still reported success. Fail loudly instead so the
-        # user can retry.
-        if sr.status_code != 200:
-            raise RuntimeError(
-                # Redacted: this url can be a pre-signed one, and the message lands in
-                # the job error, the UI and the log.
-                f"stem download failed for '{name}': HTTP {sr.status_code} from "
-                f"{_redact_url(final_url)}"
-            )
-        # Trust the URL's own extension: roformer emits .flac, demucs .wav.
-        # (Hardcoding .wav mislabels flac stems.) Use the FINAL url - a redirect is
-        # what actually names the file. Strip BOTH the query and any fragment first -
-        # ".flac#frag" would otherwise not match _AUDIO_EXTS and fall back to .wav.
-        clean = str(final_url).split("?", 1)[0].split("#", 1)[0]
-        suffix = Path(clean).suffix.lower()
-        ext = suffix if suffix in _AUDIO_EXTS else ".wav"
-        (result_dir / f"{_sanitize(name)}{ext}").write_bytes(sr.content)
+        sr, final_url = _get_authed(
+            url, server_url, headers, timeout=180, stream=True,
+        )
+        target = None
+        try:
+            # Skipping a failed download silently produced a pak that LOOKS split but is
+            # missing stems, and the job still reported success. Fail loudly instead so
+            # the user can retry.
+            if sr.status_code != 200:
+                raise RuntimeError(
+                    # Redacted: this url can be a pre-signed one, and the message lands
+                    # in the job error, the UI and the log.
+                    f"stem download failed for '{name}': HTTP {sr.status_code} from "
+                    f"{_redact_url(final_url)}"
+                )
+            # Trust the URL's own extension: roformer emits .flac, demucs .wav.
+            # (Hardcoding .wav mislabels flac stems.) Use the FINAL url - a redirect is
+            # what actually names the file. Strip BOTH the query and any fragment first.
+            clean = str(final_url).split("?", 1)[0].split("#", 1)[0]
+            suffix = Path(clean).suffix.lower()
+            ext = suffix if suffix in _AUDIO_EXTS else ".wav"
+            target = result_dir / f"{_sanitize(name)}{ext}"
+            with target.open("wb") as handle:
+                for chunk in sr.iter_content(chunk_size=1024 * 1024):
+                    if cancel_cb:
+                        cancel_cb()
+                    if chunk:
+                        handle.write(chunk)
+        except Exception:
+            if target is not None:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            raise
+        finally:
+            sr.close()
+
+    if progress_cb:
+        progress_cb(0.74, "Requested stems downloaded")
+
+    # Ephemeral consumers have all bytes they need now. Remove the managed
+    # server's result cache as well as their caller-owned temp directory so a
+    # one-off single-stem export cannot accumulate six lossless stems per song
+    # in the server cache. Cache cleanup is best-effort: a transient network
+    # failure must not discard an otherwise successful export, and the server's
+    # normal TTL/max-job sweeper remains the fallback.
+    if cleanup_cache and isinstance(job_id, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", job_id):
+        _cleanup_remote_cache(requests, server_url, job_id, headers)
     return result_dir
 
 
@@ -561,6 +670,73 @@ def _collect_stem_files(result_dir: Path) -> list[Path]:
     return files
 
 
+def separate_audio(mix: Path, out_dir: Path, *, engine: str,
+                   model: str | None = None,
+                   server_url: str | None = None, api_key: str | None = None,
+                   engine_dir: str | None = None, models_dir: str | None = None,
+                   stems: tuple[str, ...] = DEFAULT_STEMS,
+                   progress_cb: ProgressCB = None,
+                   cancel_cb: CancelCB = None,
+                   ephemeral: bool = False) -> dict[str, Path]:
+    """Separate one audio file and return canonical stem id -> local file.
+
+    This is the narrow reusable boundary for consumers that need temporary
+    stems without rewriting a feedpak. All returned paths live below the
+    caller-owned ``out_dir``; deleting that directory discards every model
+    output, including outputs a six-stem model calculated but the consumer did
+    not need.
+
+    Remote servers receive the requested ``stems`` hint. A model may still
+    compute or return its full set; that remains an engine detail at this
+    boundary and never implies those stems must be persisted in a feedpak.
+    """
+    mix = Path(mix)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if cancel_cb:
+        cancel_cb()
+
+    if engine == "remote":
+        if not server_url:
+            raise RuntimeError("remote engine selected but no split server configured")
+        result_dir = _run_remote(
+            mix, out_dir, model or DEFAULT_REMOTE_MODEL,
+            server_url, api_key, stems, progress_cb, cancel_cb,
+            cleanup_cache=ephemeral,
+        )
+    elif engine == "audio-separator":
+        result_dir = _run_audio_separator(
+            mix, out_dir, model or DEFAULT_REMOTE_MODEL,
+            models_dir, engine_dir, progress_cb,
+        )
+    elif engine == "demucs":
+        result_dir = _run_demucs_local(
+            mix, out_dir, model or DEFAULT_DEMUCS_MODEL,
+            engine_dir, models_dir, progress_cb, cancel_cb,
+        )
+    else:
+        raise RuntimeError(f"unknown split engine: {engine!r}")
+
+    stem_files = _collect_stem_files(result_dir)
+    if not stem_files:
+        raise RuntimeError("separation produced no stem files")
+
+    produced: dict[str, Path] = {}
+    for audio_file in stem_files:
+        stem_id = _normalize_stem_id(audio_file.stem)
+        if stem_id is None:
+            stem_id = _sanitize(audio_file.stem)
+            if "_" in stem_id and stem_id.split("_")[-1] in _STEM_ORDER:
+                stem_id = stem_id.split("_")[-1]
+        # Deterministic first-wins: a two-stem model can emit multiple labels
+        # that canonicalise to `other`.
+        produced.setdefault(stem_id, audio_file)
+
+    if cancel_cb:
+        cancel_cb()
+    return produced
+
+
 def _merge_stem_entries(existing: list[dict], produced: list[dict],
                         replace_stems: set[str] | None) -> list[dict]:
     """Merge freshly separated stem entries into a pak's existing stems list.
@@ -623,23 +799,12 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
         work = Path(td)
         mix = pak_io.extract_mix(pak_path, manifest, work)
 
-        if engine == "remote":
-            if not server_url:
-                raise RuntimeError("remote engine selected but no split server configured")
-            result_dir = _run_remote(mix, work, model or DEFAULT_REMOTE_MODEL,
-                                     server_url, api_key, stems, progress_cb, cancel_cb)
-        elif engine == "audio-separator":
-            result_dir = _run_audio_separator(mix, work, model or DEFAULT_REMOTE_MODEL,
-                                               models_dir, engine_dir, progress_cb)
-        elif engine == "demucs":
-            result_dir = _run_demucs_local(mix, work, model or DEFAULT_DEMUCS_MODEL,
-                                           engine_dir, models_dir, progress_cb, cancel_cb)
-        else:
-            raise RuntimeError(f"unknown split engine: {engine!r}")
-
-        stem_files = _collect_stem_files(result_dir)
-        if not stem_files:
-            raise RuntimeError("separation produced no stem files")
+        separated = separate_audio(
+            mix, work, engine=engine, model=model,
+            server_url=server_url, api_key=api_key,
+            engine_dir=engine_dir, models_dir=models_dir,
+            stems=stems, progress_cb=progress_cb, cancel_cb=cancel_cb,
+        )
 
         if progress_cb:
             progress_cb(0.8, "Encoding stems")
@@ -649,21 +814,7 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
 
         add_files: dict[str, Path] = {}
         produced: list[dict] = []
-        seen_ids: set[str] = set()
-        for wav in stem_files:
-            stem_id = _normalize_stem_id(wav.stem)
-            if stem_id is None:
-                # Unrecognized label — keep a sanitized token so no audio is lost
-                # (it just won't match the v3 stem filter).
-                sid = _sanitize(wav.stem)
-                if "_" in sid and sid.split("_")[-1] in pak_io.ALLOWED_STEM_IDS:
-                    sid = sid.split("_")[-1]
-                stem_id = sid
-            if stem_id in seen_ids:
-                # Two outputs mapped to the same id (e.g. a 2-stem model's
-                # instrumental collapsing onto "other"): keep the first.
-                continue
-            seen_ids.add(stem_id)
+        for stem_id, wav in separated.items():
             if (replace_stems is not None and stem_id not in replace_stems
                     and stem_id in existing_ids):
                 # Protected: the pak already has this stem and the user chose

@@ -43,7 +43,7 @@ class GetAuthed(unittest.TestCase):
         Returns (result, calls) where calls is the list of (url, headers) seen."""
         calls = []
 
-        def fake_get(u, headers=None, timeout=None, allow_redirects=None):
+        def fake_get(u, headers=None, timeout=None, allow_redirects=None, stream=False):
             calls.append((u, headers))
             # Redirects must be handled by US, never by requests.
             assert allow_redirects is False, "redirects must not be auto-followed"
