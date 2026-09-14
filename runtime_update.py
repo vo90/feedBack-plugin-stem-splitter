@@ -108,6 +108,94 @@ def _hash_file(path: Path, cancel: Callable[[], None] | None = None) -> str:
     return digest.hexdigest()
 
 
+def _local_test_scope(config_dir: Path) -> Path | None:
+    """Process-only opt-in, bound to one profile even if its environment leaks."""
+    bundle = os.environ.get("FEEDBACK_STEM_TEST_SOURCE", "").strip()
+    scope = os.environ.get("FEEDBACK_STEM_TEST_CONFIG_DIR", "").strip()
+    if not bundle and not scope:
+        return None
+    if not scope or not Path(scope).is_absolute():
+        raise ValueError("Local test source needs an absolute FEEDBACK_STEM_TEST_CONFIG_DIR")
+    if Path(scope).resolve() != Path(config_dir).resolve():
+        return None
+    if not bundle or not Path(bundle).is_absolute():
+        raise ValueError("Local test source needs an absolute FEEDBACK_STEM_TEST_SOURCE bundle path")
+    return Path(bundle).resolve()
+
+
+def _local_test_source(config_dir: Path) -> dict | None:
+    """Read a hash-bound Git archive; never consult a working tree or network."""
+    path = _local_test_scope(config_dir)
+    if path is None:
+        return None
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            raise ValueError("Local test source metadata is too large")
+        raw = path.read_bytes()
+        bundle = json.loads(raw)
+        if not isinstance(bundle, dict) or bundle.get("schema_version") != 1 or bundle.get("kind") != "local_git_archive":
+            raise ValueError("Unsupported local test source bundle")
+        commit = str(bundle.get("source_commit", "")).lower()
+        if not _COMMIT.fullmatch(commit):
+            raise ValueError("Local test source requires the full Git commit")
+        ref = bundle.get("ref")
+        if not isinstance(ref, str) or not ref.strip() or len(ref) > 200:
+            raise ValueError("Local test source requires a revision label")
+        files = {}
+        for name in ("archive", "manifest"):
+            digest = str(bundle.get(name + "_sha256", "")).lower()
+            if not _SHA.fullmatch(digest):
+                raise ValueError("Local test source requires full file SHA-256 digests")
+            relative = bundle.get(name)
+            if not isinstance(relative, str):
+                raise ValueError("Local test source requires relative file paths")
+            asset = (path.parent / _safe_relative(relative)).resolve()
+            if not asset.is_relative_to(path.parent) or not asset.is_file():
+                raise ValueError("Local test source files must stay inside the bundle directory")
+            limit = 64 * 1024 * 1024 if name == "archive" else 1024 * 1024
+            if asset.stat().st_size > limit or _hash_file(asset) != digest:
+                raise ValueError(f"Local test source {name} failed SHA-256 or size verification")
+            files[name] = asset
+        size = bundle.get("archive_size")
+        if type(size) is not int or size < 1 or files["archive"].stat().st_size != size:
+            raise ValueError("Local test source archive has an incorrect size")
+        with zipfile.ZipFile(files["archive"]) as archive:
+            if archive.comment != commit.encode("ascii"):
+                raise ValueError("Local test source archive does not identify the expected Git commit")
+        manifest = json.loads(files["manifest"].read_bytes())
+        if not isinstance(manifest, dict):
+            raise ValueError("Local test source manifest must be an object")
+        _validate_manifest(manifest)
+        identity = {"kind": "local_test", "label": "Local test source (not published)",
+                    "commit": commit, "ref": ref,
+                    "bundle_sha256": hashlib.sha256(raw).hexdigest(),
+                    "archive_sha256": bundle["archive_sha256"].lower()}
+        return {"source": identity, "manifest": manifest, "archive": files["archive"], "archive_size": size}
+    except (OSError, KeyError, TypeError, AttributeError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"Local test source is unavailable: {exc}. Restart using the test launcher") from exc
+
+
+def _source_description(config_dir: Path) -> dict:
+    try:
+        local = _local_test_source(config_dir)
+        return local["source"] if local else {"kind": "github", "label": "Official GitHub source"}
+    except ValueError as exc:
+        return {"kind": "local_test", "label": "Local test source (unavailable)", "error": str(exc)}
+
+
+def _validate_source_plan(config_dir: Path, plan: dict) -> dict | None:
+    local = _local_test_source(config_dir)
+    source = plan.get("source", {})
+    if source.get("kind") == "local_test":
+        if not local or local["source"] != source or local["source"]["commit"] != plan["source_commit"]:
+            raise ValueError("Local test source changed or is no longer enabled; restart the test launcher and check again")
+        if _digest(local["manifest"]) != plan["manifest_sha256"]:
+            raise ValueError("Local test source manifest changed; check for updates again")
+    elif local:
+        raise ValueError("Server source changed since this plan; check for updates again")
+    return local
+
+
 def _generation(config_dir: Path, generation_id: str) -> Path:
     if generation_id == "legacy":
         return _base(config_dir)
@@ -242,6 +330,8 @@ def inventory(config_dir: Path) -> dict:
         return {"installed": (root / "src" / "server.py").is_file(),
                 "generation_id": generation_id, "legacy": generation_id == "legacy",
                 "source_commit": receipt.get("source_commit") or source.get("commit"),
+                "source": _source_description(config_dir),
+                "installed_source": receipt.get("source") or source.get("source"),
                 "ref": source.get("ref"), "profile_id": receipt.get("profile_id"),
                 "dependencies": versions, "audio_separator": versions.get("audio-separator"),
                 "models": models, "model_verification": "verified" if models and generation_id != "legacy" else "verification_pending",
@@ -279,7 +369,7 @@ def status(config_dir: Path) -> dict:
             "cancel_requested": False, "error": None, **data}
     data.update(active=running, needs_recovery=interrupted or data.get("state") == "recovery_required",
                 pending_activation=data.get("state") == "waiting_to_activate",
-                rollback_available=bool(pointer.get("previous_generation")))
+                rollback_available=bool(pointer.get("previous_generation")), source=_source_description(config_dir))
     if interrupted:
         data["phase"] = "Interrupted — recovery required"
     plan_id = data.get("plan_id")
@@ -290,7 +380,7 @@ def status(config_dir: Path) -> dict:
             # after UI reload. No manifest, asset paths, credentials or ability
             # to reapply the old transaction is exposed through this snapshot.
             data["checked_plan"] = {key: checked.get(key) for key in
-                ("plan_id", "model", "available", "dependency_graph", "server_state", "libraries_state")}
+                ("plan_id", "model", "available", "dependency_graph", "server_state", "libraries_state", "source")}
             data["checked_plan"]["can_update"] = False
     return data
 
@@ -425,15 +515,23 @@ def check_updates(config_dir: Path, ref: str | None = None, model: str = "bs_rof
         raise ValueError("Unknown runtime update component")
     result = {"schema_version": SCHEMA_VERSION, "installed": installed, "components": selected,
               "model": model, "can_update": False, "state": "unknown", "reason": None,
+              "source": _source_description(config_dir),
               "dependency_graph": "Resolved and validated during explicit staging; direct version checks do not certify transitive packages."}
     try:
         gpu = bool(installed.get("install_info", {}).get("gpu")) if gpu is None else bool(gpu)
         tag = str(cuda_tag or installed.get("install_info", {}).get("cuda_tag") or ds.DEFAULT_CUDA_TAG).strip()
-        ref = ds._norm_ref(ref)
-        commit = ds._resolve_commit(ref) if "server" in selected else installed.get("source_commit")
+        local = _local_test_source(config_dir)
+        ref = local["source"]["ref"] if local else ds._norm_ref(ref)
+        if local:
+            commit = local["source"]["commit"]
+            if "server" not in selected and commit != installed.get("source_commit"):
+                raise ValueError("This local test bundle changes the server; include Server")
+        else:
+            commit = ds._resolve_commit(ref) if "server" in selected else installed.get("source_commit")
         if not commit or not _COMMIT.fullmatch(commit):
             raise ValueError("Could not resolve an immutable server revision; nothing was installed")
-        manifest = _load_manifest(commit)
+        manifest = local["manifest"] if local else _load_manifest(commit)
+        source = local["source"] if local else {"kind": "github", "label": "Official GitHub source", "commit": commit, "ref": ref}
         _validate_manifest(manifest)
         profile_id, profile = _select_profile(manifest, gpu, tag)
         model_ids = sorted(set(installed.get("models", {})) | {model})
@@ -456,7 +554,7 @@ def check_updates(config_dir: Path, ref: str | None = None, model: str = "bs_rof
                        "available": spec["revision"], "state": "current" if installed.get("models", {}).get(name, {}).get("revision") == spec["revision"] else "available",
                        "download_bytes": sum(asset["size"] for asset in spec["assets"])} for name, spec in models.items()]
         plan = {**result, "plan_id": uuid.uuid4().hex, "created_at": time.time(), "state": "available",
-                "can_update": True, "ref": ref, "source_commit": commit, "profile_id": profile_id,
+                "can_update": True, "ref": ref, "source_commit": commit, "source": source, "profile_id": profile_id,
                 "profile": profile, "manifest": manifest, "manifest_sha256": _digest(manifest),
                 "available": {"server": commit, "dependencies": releases, "models": model_rows},
                 "gpu": gpu, "cuda_tag": tag, "model_specs": models,
@@ -562,6 +660,7 @@ def _get_plan(config_dir: Path, plan_id: str) -> dict:
     _validate_manifest(plan["manifest"])
     if _digest(plan["manifest"]) != plan.get("manifest_sha256"):
         raise ValueError("Update manifest changed after planning")
+    _validate_source_plan(config_dir, plan)
     return plan
 
 
@@ -598,10 +697,25 @@ def _download_file(url: str, target: Path, cancel, *, size: int | None = None,
 def _stage_source(config_dir: Path, root: Path, plan: dict, cancel) -> None:
     import demucs_server as ds
     archive = root / "source.zip"
-    _download_file(f"https://codeload.github.com/{ds.SOURCE_REPO}/zip/{plan['source_commit']}", archive, cancel)
+    local = _validate_source_plan(config_dir, plan)
     source = root / "src"
-    source.mkdir()
     try:
+        if local:
+            # Copy into the owned generation and verify the copy, closing the
+            # check-to-copy race without executing anything from the bundle.
+            with local["archive"].open("rb") as src, archive.open("xb") as dst:
+                copied = 0
+                for block in iter(lambda: src.read(1024 * 1024), b""):
+                    cancel()
+                    copied += len(block)
+                    if copied > local["archive_size"]:
+                        raise ValueError("Local test source archive changed during staging")
+                    dst.write(block)
+            if archive.stat().st_size != local["archive_size"] or _hash_file(archive, cancel) != plan["source"]["archive_sha256"]:
+                raise ValueError("Local test source archive changed during staging")
+        else:
+            _download_file(f"https://codeload.github.com/{ds.SOURCE_REPO}/zip/{plan['source_commit']}", archive, cancel)
+        source.mkdir()
         found = set()
         with zipfile.ZipFile(archive) as handle:
             for info in handle.infolist():
@@ -619,7 +733,7 @@ def _stage_source(config_dir: Path, root: Path, plan: dict, cancel) -> None:
         if _digest(manifest) != plan["manifest_sha256"]:
             raise ValueError("Downloaded source does not match the planned compatibility manifest")
         _atomic_json(root / "source.json", {"repo": ds.SOURCE_REPO, "ref": plan["ref"],
-                                           "commit": plan["source_commit"], "installed_at": time.time()})
+                                           "commit": plan["source_commit"], "source": plan.get("source"), "installed_at": time.time()})
     finally:
         archive.unlink(missing_ok=True)
 
@@ -901,6 +1015,7 @@ def _stage_candidate(config_dir: Path, plan: dict, cancel, callback) -> Path:
     root.mkdir(parents=True, exist_ok=False)
     _persist(config_dir, generation_id=identity, previous_generation=_active_id(config_dir), plan_id=plan["plan_id"])
     receipt = {"schema_version": SCHEMA_VERSION, "generation_id": identity, "source_commit": plan["source_commit"],
+               "source": plan.get("source"),
                "profile_id": plan["profile_id"], "manifest_sha256": plan["manifest_sha256"],
                "created_at": time.time(), "owner": "stem_splitter", "validated": False,
                "prepared": False, "python": platform.python_version(), "platform": sys.platform,

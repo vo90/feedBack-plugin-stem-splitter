@@ -92,6 +92,18 @@ test('opening settings reads versions without checking the internet or installin
   assert.ok(!ui.requests.some(r => /runtime\/(check|update)|server\/(update|install)$/.test(r.endpoint)));
 });
 
+test('local test source is visible before checking and cannot be changed with the revision field', async () => {
+  const source = {kind: 'local_test', label: 'Local test source (not published)',
+    ref: 'feat/managed-separator-runtime', commit: 'd9edcc85'.repeat(5)};
+  const ui = harness({'/server/runtime/inventory': {installed: false, source}});
+  await ui.flush();
+  assert.equal(ui.nodes.get('ss-runtime-source').hidden, false);
+  assert.match(ui.nodes.get('ss-runtime-source').textContent, /Local test source/);
+  assert.match(ui.nodes.get('ss-runtime-source').textContent, /d9edcc85/);
+  assert.equal(ui.nodes.get('ss-srv-ref').disabled, true);
+  assert.ok(!ui.requests.some(r => r.endpoint === '/server/runtime/check'));
+});
+
 test('checking exposes versions but installation requires the separate apply action', async () => {
   const ui = harness();
   await ui.flush();

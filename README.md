@@ -224,6 +224,23 @@ otherwise it says why rather than ticking a box that silently runs on CPU.
 
 Target Host: feedBack desktop with the v3 UI (`window.feedBack.uiVersion === 'v3'`).
 
+## Testing unpublished server changes locally
+
+A development launcher can set `FEEDBACK_STEM_TEST_SOURCE` to an immutable local
+Git-archive bundle and `FEEDBACK_STEM_TEST_CONFIG_DIR` to the absolute config
+directory of one isolated test profile. Both are process environment variables;
+the plugin does not save them as application settings. Other profiles use the
+normal GitHub source. Settings displays **Local test source (not published)** and
+the selected commit while this mode is enabled.
+
+The bundle identifies a full Git commit and contains the source ZIP and runtime
+manifest with SHA-256 hashes. Checking and applying validate the same bundle;
+changing or removing it invalidates a previously checked plan. Only server-source
+retrieval changes: dependency resolution, model downloads, hash verification,
+real inference, activation and rollback use the normal updater. Nothing is
+uploaded or published. Launch the same isolated profile with its test launcher
+each time to retain that source selection.
+
 ## License
 
 **AGPL-3.0-only** — the same license as the feedBack app. See [LICENSE](LICENSE).
