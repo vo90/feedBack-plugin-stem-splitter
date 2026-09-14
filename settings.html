@@ -51,6 +51,7 @@
   text-align: center;
 }
 #ss-settings .ss-actionbtn[disabled] { opacity: .45; cursor: not-allowed; }
+#ss-settings .ss-actionbtn[hidden] { display: none; }
 #ss-settings .ss-actionbtn.busy .dot { animation: ss-pulse 1.4s ease-in-out infinite; }
 
 /* ── Section structure ────────────────────────────────────────────────────────
@@ -172,8 +173,9 @@
   <section class="ss-section server">
     <h3>Local demucs server <span class="ss-h-note" id="ss-srv-saved">recommended — start here</span></h3>
   <p class="ss-muted"><strong>The easiest way to get splitting working.</strong> Runs got-feedBack's real
-    demucs/whisperx server on this machine and manages it for you. <em>Install server + models</em> does
-    the whole setup in one click (dependencies, then the model weights) and starts it.</p>
+    demucs/whisperx server on this machine and manages it for you. Check the available
+    versions, then prepare a verified update of the server, libraries and stem models.
+    Use <em>Start</em> when your first installation is ready.</p>
   <p class="ss-note">Once it's running, the plugin uses it automatically — nothing else to configure.
     It can use your <strong>GPU</strong> (big speed-up: seconds instead of minutes), it runs in its own
     process so it can't destabilise the app, and <em>Uninstall server</em> removes every byte it
@@ -203,13 +205,32 @@
   </div>
 
   <div class="row" style="margin-top:.6rem">
-    <button class="ss-actionbtn blue" id="ss-srv-install"><span id="ss-srv-install-label">Install server + models (~5 GB)</span></button>
+    <button class="ss-actionbtn blue" id="ss-srv-install"><span id="ss-srv-install-label">Prepare server installation</span></button>
     <!-- One button. Its COLOUR is the server's state (red = down, green = up); its
          LABEL is what clicking will do. -->
     <button class="ss-actionbtn red" id="ss-srv-toggle"><i class="dot"></i><span id="ss-srv-toggle-label">Start server</span></button>
     <button class="ss-actionbtn grey" id="ss-srv-test">Test status</button>
-    <button class="ss-actionbtn grey" id="ss-srv-update">Check for update</button>
+    <button class="ss-actionbtn grey" id="ss-srv-update">Check for updates</button>
     <button class="ss-actionbtn grey" id="ss-srv-uninstall">Uninstall server</button>
+  </div>
+
+  <div id="ss-runtime-panel" style="margin-top:1rem">
+    <p class="ss-note" id="ss-runtime-note" aria-live="polite">Check for server, library and model updates. Existing songs are kept as they are.</p>
+    <table style="width:100%;text-align:left;font-size:.85rem;border-collapse:collapse">
+      <thead><tr><th>Component</th><th>Installed</th><th>Available</th></tr></thead>
+      <tbody id="ss-runtime-versions"><tr><td colspan="3">Reading installed versions…</td></tr></tbody>
+    </table>
+    <div class="row" style="margin-top:.65rem">
+      <button class="ss-actionbtn blue" id="ss-runtime-apply" disabled>Update server, libraries and models</button>
+      <button class="ss-actionbtn grey" id="ss-runtime-cancel" hidden>Cancel update</button>
+      <button class="ss-actionbtn blue" id="ss-runtime-activate" hidden>Apply prepared update</button>
+      <button class="ss-actionbtn grey" id="ss-runtime-rollback" hidden>Restore previous version</button>
+      <button class="ss-actionbtn grey" id="ss-runtime-discard" hidden>Discard prepared update</button>
+    </div>
+    <details class="ss-adv"><summary>Update details</summary>
+      <p class="ss-note">Libraries are resolved and checked together during installation. A newer release may be unavailable for your Python version or device.</p>
+      <pre id="ss-runtime-details" style="white-space:pre-wrap;word-break:break-word;font-size:.75rem"></pre>
+    </details>
   </div>
 
   <details class="ss-adv" id="ss-srv-adv">
@@ -217,7 +238,7 @@
     <div class="ss-adv-body">
       <p class="ss-note" style="margin-top:0">Only needed if you're testing a specific server revision,
         or if the default CUDA build doesn't match your driver. Changing these takes effect on the
-        <strong>next install</strong> — use <em>Uninstall server</em>, then install again.</p>
+        <strong>next update</strong>. Check for updates after changing these settings.</p>
 
       <div class="row">
         <div>
@@ -332,7 +353,21 @@
   window.__stemSplitterSettingsLoaded = true;
   var API = '/api/plugins/stem_splitter';
   function $(id) { return document.getElementById(id); }
-  function j(path, opts) { return fetch(API + path, opts).then(function (r) { return r.json(); }); }
+  function j(path, opts) {
+    return fetch(API + path, opts).then(function (r) {
+      return r.json().then(function (data) {
+        if (!r.ok) throw new Error(data.detail || data.error || 'Request failed (' + r.status + ')');
+        return data;
+      });
+    });
+  }
+
+  var runtimeInventory = null;
+  var runtimePlan = null;
+  var runtimeSettingsRevision = 0;
+  var runtimePlanSignature = null;
+  var runtimeState = null;
+  var runtimeChecking = false;
 
   function loadConfig() {
     j('/config').then(function (cfg) {
@@ -505,6 +540,10 @@
           setDkBar(m.pct, m.phase);
           setDkButtons(true);
         } else {
+          if (String(m.op || '').indexOf('runtime_') === 0) {
+            runtimeState = Object.assign({}, runtimeState || {}, m);
+            renderRuntimeUpdates();
+          }
           $('ss-srv-progress').style.display = 'block';
           if (m.line) appendLog($('ss-srv-log'), m.line);
           setSrvBar(m.pct, m.phase);
@@ -517,10 +556,16 @@
           setDkButtons(false);
           loadDocker();
         } else {
-          appendLog($('ss-srv-log'), '✓ ' + m.op + ' done.');
-          setSrvBar(1, 'Done', true);
+          var isRuntime = String(m.op || '').indexOf('runtime_') === 0;
+          var result = isRuntime && m.status || {};
+          appendLog($('ss-srv-log'), '✓ ' + (result.phase || m.op + ' done.'));
+          setSrvBar(isRuntime ? result.pct : 1, result.phase || 'Done', true);
+          if (isRuntime) {
+            runtimeState = result;
+            runtimePlan = null;
+          }
           setServerButtons(false);
-          if (m.status) renderServerStatus(m.status); else loadServerStatus();
+          if (m.status && !isRuntime) renderServerStatus(m.status); else loadServerStatus();
         }
       } else if (m.type === 'server_error') {
         if (isDk(m.op)) {
@@ -529,6 +574,7 @@
           setDkButtons(false);
           loadDocker();
         } else {
+          if (String(m.op || '').indexOf('runtime_') === 0) runtimePlan = null;
           appendLog($('ss-srv-log'), '✗ ' + m.error);
           setSrvBar(0, 'Failed', true);
           setServerButtons(false);
@@ -611,12 +657,18 @@
       var prev = el.textContent;
       el.textContent = 'Saved ✓';
       setTimeout(function () { el.textContent = prev; }, 1500);
-    }).catch(function () {});
+    });
   }
 
   function queueServerSave() {
+    runtimeSettingsRevision++;
+    runtimePlan = null;
+    renderRuntimeUpdates();
     if (srvSaveTimer) clearTimeout(srvSaveTimer);
-    srvSaveTimer = setTimeout(function () { srvSaveTimer = null; saveServerSettings(); }, 400);
+    srvSaveTimer = setTimeout(function () {
+      srvSaveTimer = null;
+      saveServerSettings().catch(function (error) { $('ss-srv-saved').textContent = 'Could not save: ' + error; });
+    }, 400);
   }
 
   SRV_FIELDS.forEach(function (id) {
@@ -629,10 +681,165 @@
                    'ss-srv-uninstall'];
   var serverManageable = true;   // false when the backend says it can't manage a server here
   var serverBusy = false;        // an install/start/stop/prepare is in flight
+  var serverButtonsRevision = 0;
   function setServerButtons(disabled) {
+    serverButtonsRevision++;
     serverBusy = !!disabled;
     var d = disabled || !serverManageable;   // never re-enable an unsupported section
     SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = d; });
+    if (lastServerStatus) { renderInstallBtn(lastServerStatus); renderToggle(lastServerStatus); }
+    renderRuntimeButtons();
+  }
+
+  function renderRuntimeButtons() {
+    var state = runtimeState || {};
+    var busy = serverBusy || runtimeChecking || !!state.active;
+    $('ss-runtime-apply').disabled = busy || !serverManageable || state.pending_activation || state.needs_recovery ||
+      !(runtimePlan && runtimePlan.can_update);
+    $('ss-runtime-cancel').hidden = !state.active;
+    $('ss-runtime-cancel').disabled = !state.active || !!state.cancel_requested || state.state === 'activating';
+    $('ss-runtime-activate').hidden = !state.pending_activation;
+    $('ss-runtime-activate').disabled = busy || !serverManageable || !!(lastServerStatus && lastServerStatus.running);
+    $('ss-runtime-rollback').hidden = !state.rollback_available;
+    $('ss-runtime-rollback').disabled = busy || !serverManageable;
+    $('ss-runtime-discard').hidden = !(state.pending_activation || state.needs_recovery ||
+      ((state.state === 'failed' || state.state === 'canceled') && state.generation_id));
+    $('ss-runtime-discard').disabled = busy || !serverManageable;
+  }
+
+  function renderRuntimeUpdates() {
+    var inv = runtimeInventory || {}, state = runtimeState || {};
+    var plan = runtimePlan || state.checked_plan;
+    var have = inv.dependencies || {}, available = plan && plan.available || {};
+    var deps = available.dependencies || {};
+    var rows = [];
+    function row(label, installed, next) {
+      rows.push('<tr><td style="padding:.3rem .6rem .3rem 0">' + esc(label) + '</td><td>' +
+        esc(installed || 'Not installed') + '</td><td>' + esc(next || 'Not checked') + '</td></tr>');
+    }
+    row('Server', inv.source_commit ? inv.source_commit.slice(0, 8) : (inv.installed ? 'Revision unknown' : ''),
+      available.server ? available.server.slice(0, 8) : '');
+    row('Separation libraries', have['audio-separator'] ? 'audio-separator ' + have['audio-separator'] : '',
+      deps['audio-separator'] ? 'audio-separator ' + deps['audio-separator'].version : '');
+    var models = available.models || [];
+    function modelVersion(id, revision) {
+      var model = (inv.models || {})[id] || {};
+      return (revision || (inv.installed && inv.legacy !== false ? 'Verification pending' : 'Not installed')) +
+        (model.state === 'damaged' ? ' — damaged; repair needed' : model.state === 'verified' ? ' — verified' : '');
+    }
+    if (models.length) {
+      models.forEach(function (model) {
+        var current = (inv.models || {})[model.id] || {};
+        row(model.id, modelVersion(model.id, current.revision || model.installed), model.available);
+      });
+    } else {
+      var ids = Object.keys(inv.models || {});
+      if (ids.length) ids.forEach(function (id) { row(id, modelVersion(id, inv.models[id].revision), ''); });
+      else row('Stem model', inv.installed ? 'Verification pending' : '', '');
+    }
+    $('ss-runtime-versions').innerHTML = rows.join('');
+    var note = 'Check for server, library and model updates. Existing songs are kept as they are.';
+    var warning = false;
+    if (runtimeChecking) note = 'Checking available server, library and model versions…';
+    else if (state.active) note = state.phase || 'Updating the local server…';
+    else if (state.needs_recovery) {
+      note = 'An update was interrupted. Restore the previous version or discard the prepared update before trying again.';
+      warning = true;
+    } else if (state.pending_activation) {
+      note = 'The update is prepared. Finish current work and stop the server, then apply it or start the server to activate it.';
+    } else if (runtimePlan && !runtimePlan.can_update) {
+      note = plan.reason || plan.error || 'Update availability could not be verified. The installed version is unchanged.';
+      warning = true;
+    } else if (state.error) {
+      note = state.error;
+      warning = true;
+    } else if (runtimePlan && runtimePlan.can_update) {
+      note = 'Ready to update. Unchanged model files will be reused. Libraries will be refreshed as a compatible set.';
+    } else if (state.state === 'active' || state.state === 'rolled_back') {
+      note = state.state === 'rolled_back' ? 'The previous working version has been restored.' :
+        'The updated installation is ready. Separate a song again to use the new versions.';
+    } else if (state.state === 'canceled') note = 'Update canceled. The active installation was kept.';
+    $('ss-runtime-note').textContent = note;
+    $('ss-runtime-note').className = warning ? 'ss-note warn' : 'ss-note';
+    var details = [];
+    Object.keys(deps).sort().forEach(function (name) {
+      var dep = deps[name];
+      details.push(name + ': ' + (have[name] || 'not installed') + ' → ' + dep.version +
+        (dep.newer_unsupported ? ' (newer release ' + dep.latest + ' is outside the supported range)' : ''));
+    });
+    if (plan && plan.dependency_graph) details.push(plan.dependency_graph);
+    if (models.length) {
+      var modelBytes = models.reduce(function (sum, model) { return sum + (model.download_bytes || 0); }, 0);
+      details.push('Selected model assets: ' + (modelBytes / 1024 / 1024).toFixed(0) +
+        ' MiB; already verified files are reused. Dependencies require additional downloads and staging space.');
+    }
+    if (!details.length) Object.keys(have).sort().forEach(function (name) { details.push(name + ': ' + have[name]); });
+    $('ss-runtime-details').textContent = details.join('\n');
+    renderRuntimeButtons();
+  }
+
+  function loadRuntimeStatus() {
+    var buttonsRevision = serverButtonsRevision;
+    return Promise.all([j('/server/runtime/inventory'), j('/server/runtime/status')]).then(function (results) {
+      runtimeInventory = results[0];
+      runtimeState = results[1];
+      // Polling must recover a missed completion event, without clearing a newer
+      // action's busy state while its HTTP request is still being dispatched.
+      if (buttonsRevision === serverButtonsRevision && !runtimeChecking)
+        setServerButtons(!!runtimeState.busy || !!runtimeState.active);
+      renderRuntimeUpdates();
+      if (runtimeState.active || runtimeState.needs_recovery || runtimeState.pending_activation) {
+        $('ss-srv-progress').style.display = 'block';
+        setSrvBar(runtimeState.pct, runtimeState.phase, true);
+      }
+    }).catch(function () {
+      $('ss-runtime-note').textContent = 'Could not read update status. Retry before starting an update.';
+      runtimePlan = null;
+      renderRuntimeButtons();
+    });
+  }
+
+  function runtimeSettingsSignature() {
+    return JSON.stringify(SRV_FIELDS.map(function (id) {
+      var el = $(id);
+      return el.type === 'checkbox' ? el.checked : el.value;
+    }).concat($('ss-set-remote-model').value));
+  }
+
+  function checkRuntimeUpdates() {
+    if (runtimeChecking) return Promise.resolve();
+    var revision = runtimeSettingsRevision;
+    var signature = runtimeSettingsSignature();
+    var body = {ref: $('ss-srv-ref').value.trim(), cuda_tag: $('ss-srv-cuda').value,
+      gpu: $('ss-srv-gpu').checked, model: $('ss-set-remote-model').value.trim() || 'bs_roformer_sw'};
+    function ensureCurrentSettings() {
+      if (revision !== runtimeSettingsRevision || signature !== runtimeSettingsSignature())
+        throw new Error('Settings changed during the check. Check for updates again.');
+    }
+    if (srvSaveTimer) { clearTimeout(srvSaveTimer); srvSaveTimer = null; }
+    runtimeChecking = true;
+    runtimePlan = null;
+    setServerButtons(true);
+    renderRuntimeUpdates();
+    return saveServerSettings().then(function () {
+      ensureCurrentSettings();
+      return j('/server/runtime/check', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    }).then(function (plan) {
+      ensureCurrentSettings();
+      runtimePlan = plan;
+      runtimePlanSignature = signature;
+      if (plan.installed && typeof plan.installed === 'object') runtimeInventory = plan.installed;
+      return plan;
+    }).catch(function (err) {
+      runtimePlan = {can_update: false, state: 'unknown', reason: 'Could not check for updates: ' + err};
+    }).finally(function () {
+      runtimeChecking = false;
+      setServerButtons(false);
+      renderRuntimeUpdates();
+    });
   }
   // The bar never runs backwards WITHIN an operation.
   //
@@ -751,29 +958,16 @@
       gpuLabel.textContent = 'Use GPU (CUDA) - no NVIDIA GPU detected';
     }
 
-    // A GPU box running a CPU-only install: offer the rebuild rather than greying out.
-    if (st.installed && g && !st.gpu_build && gpuBox.checked) {
-      setBtnTone('ss-srv-install', 'amber');
-      label.textContent = 'Reinstall with GPU (~5.5 GB)';
-      btn.disabled = serverBusy || !serverManageable;
-      btn.title = 'torch is the CPU-only build; rebuild it against CUDA to use ' + g.name;
-      return;
-    }
-
     if (!st.installed) {
       setBtnTone('ss-srv-install', 'blue');
-      label.textContent = 'Install server + models (~5 GB)';
-      btn.disabled = serverBusy || !serverManageable;
-    } else if (!st.models_downloaded) {
-      setBtnTone('ss-srv-install', 'amber');
-      label.textContent = 'Download models (~2 GB)';   // deps are there; finish the job
+      label.textContent = 'Prepare server installation';
       btn.disabled = serverBusy || !serverManageable;
     } else {
       setBtnTone('ss-srv-install', 'grey');
-      label.textContent = 'Installed ✓';
-      btn.disabled = true;                              // nothing left to do
-      btn.title = 'Server and models are installed. Use Uninstall server to remove them.';
+      label.textContent = 'Check installation / repair';
+      btn.disabled = serverBusy || !serverManageable;
     }
+    btn.title = 'Check compatible server, library and model versions before preparing a verified installation.';
   }
 
   function renderToggle(st) {
@@ -900,8 +1094,12 @@
   }
 
   function loadServerStatus() {
-    return j('/server_status').then(renderServerStatus).catch(function () {});
+    return j('/server_status').then(renderServerStatus).catch(function () {}).then(loadRuntimeStatus);
   }
+
+  setInterval(function () {
+    if (runtimeState && runtimeState.active) loadRuntimeStatus();
+  }, 2000);
 
   // Poll while the server is up but not yet warm, so the per-model warmup chips
   // tick from pending -> downloading -> ready on their own. Idle otherwise (and
@@ -1038,35 +1236,7 @@
     });
   }
 
-  $('ss-srv-install').addEventListener('click', function () {
-    var st = lastServerStatus || {};
-
-    // Deps already installed, only the weights missing: fetch just those. Re-running
-    // the full install would needlessly re-download ~3 GB of packages already on disk.
-    if (st.installed && !st.models_downloaded) {
-      if (!confirm('Download the model weights (~2 GB)?\n\nThe dependencies are already '
-                   + 'installed; this finishes the setup and warms the server up.')) return;
-      serverOp('/server/prepare_models', 'Downloading models').then(loadServerStatus);
-      return;
-    }
-
-    // Everything else is a (re)install. Carry the CURRENT selections — the button can
-    // promise a GPU rebuild, so it has to actually send the GPU choice rather than
-    // letting the backend fall back to the saved config or auto-detect.
-    var useGpu = $('ss-srv-gpu').checked;
-    var rebuilding = st.installed;
-    if (!confirm((rebuilding ? 'Reinstall the demucs server?' : 'Set up the demucs server?')
-                 + '\n\nThis downloads its Python dependencies ('
-                 + (useGpu ? '~5.5 GB, CUDA build' : '~3 GB, CPU build')
-                 + ')' + (rebuilding ? '' : ' and the model weights (~2 GB)')
-                 + ', then starts it.')) return;
-
-    serverOpBody('/server/install', rebuilding ? 'Reinstalling server' : 'Setting up server', {
-      gpu: useGpu,
-      ref: $('ss-srv-ref').value.trim(),   // blank = default
-      cuda_tag: $('ss-srv-cuda').value,    // blank = default
-    }).then(loadServerStatus);
-  });
+  $('ss-srv-install').addEventListener('click', checkRuntimeUpdates);
   $('ss-srv-toggle').addEventListener('click', function () {
     var running = lastServerStatus && lastServerStatus.running;
     var label = $('ss-srv-toggle-label');
@@ -1252,62 +1422,37 @@
   });
 
 
-  // ── Update the server source ───────────────────────────────────────────────
-  //
-  // server.py is downloaded at INSTALL time and never touched again, so a bug fixed upstream
-  // cannot reach anyone who already installed — short of uninstalling and re-downloading
-  // several GB of wheels for a one-line change, which nobody does. In practice the fix never
-  // lands. (The cache sweeper that deletes model weights daily is exactly that: fixed
-  // upstream, unreachable in the field.)
-  //
-  // Two steps on purpose: CHECK hits the network, so it only happens on a click — the status
-  // poll must stay offline. Then update only if there is actually something newer, so the
-  // button doesn't restart a healthy server for nothing.
-  $('ss-srv-update').addEventListener('click', function () {
-    setServerButtons(true);
-    $('ss-srv-progress').style.display = 'block';
-    $('ss-srv-log').textContent = 'Checking for a newer server revision…\n';
-    setSrvBar(0.1, 'Checking', true);
-
-    j('/server/check_update').then(function (r) {
-      if (!r || !r.installed) {
-        srvLog('The server is not installed, so there is nothing to update.');
-        setSrvBar(0, 'Not installed', true);
-        setServerButtons(false);
-        return;
-      }
-      if (r.latest == null) {
-        srvLog('✗ ' + (r.reason || 'Could not reach GitHub.'));
-        setSrvBar(0, 'Offline', true);
-        setServerButtons(false);
-        return;
-      }
-      var have = (r.commit || '').slice(0, 8) || 'unknown';
-      var latest = (r.latest || '').slice(0, 8);
-      if (!r.update_available && !r.unknown) {
-        srvLog('✓ Already up to date (' + have + ').');
-        setSrvBar(1, 'Up to date', true);
-        setServerButtons(false);
-        return;
-      }
-      srvLog(r.unknown
-        ? 'This install predates commit tracking, so its revision is unknown — updating to '
-          + latest + '.'
-        : 'Update available: ' + have + ' → ' + latest + '. Updating…');
-      setSrvBar(0.2, 'Updating');
-      connectWS();
-      return j('/server/update', { method: 'POST' }).then(function (res) {
-        if (res && res.ok === false && res.busy) {
-          srvLog('… ' + (res.message || 'another server operation is running'));
-          setSrvBar(0, 'Busy', true);
-          setServerButtons(false);
-        }
-      });
-    }).catch(function (e) {
-      srvLog('✗ ' + e);
-      setSrvBar(0, 'Failed', true);
-      setServerButtons(false);
+  $('ss-srv-update').addEventListener('click', checkRuntimeUpdates);
+  $('ss-set-remote-model').addEventListener('input', function () {
+    runtimeSettingsRevision++;
+    runtimePlan = null;
+    renderRuntimeUpdates();
+  });
+  $('ss-runtime-apply').addEventListener('click', function () {
+    if (!runtimePlan || !runtimePlan.can_update) return;
+    if (runtimePlanSignature !== runtimeSettingsSignature()) {
+      runtimePlan = {can_update: false, reason: 'Settings changed. Check for updates again.'};
+      renderRuntimeUpdates();
+      return;
+    }
+    var plan = runtimePlan;
+    serverOpBody('/server/runtime/update', 'Preparing verified update', {plan_id: plan.plan_id});
+  });
+  $('ss-runtime-cancel').addEventListener('click', function () {
+    $('ss-runtime-cancel').disabled = true;
+    j('/server/runtime/cancel', {method: 'POST'}).then(loadRuntimeStatus).catch(function (error) {
+      srvLog('✗ ' + error);
+      loadRuntimeStatus();
     });
+  });
+  $('ss-runtime-activate').addEventListener('click', function () {
+    serverOp('/server/runtime/activate', 'Applying prepared update');
+  });
+  $('ss-runtime-rollback').addEventListener('click', function () {
+    serverOp('/server/runtime/rollback', 'Restoring previous version');
+  });
+  $('ss-runtime-discard').addEventListener('click', function () {
+    serverOp('/server/runtime/discard', 'Discarding prepared update');
   });
 
   loadConfig();

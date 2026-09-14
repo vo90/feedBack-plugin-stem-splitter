@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0
+
+### Update the complete managed local separator from Settings
+
+- Check the installed and available server, library and stem-model versions, then
+  explicitly prepare a complete compatible update. Opening Settings only reads the
+  local inventory. Failed or offline checks never report that everything is current.
+- Install into a separate generation, verify model SHA-256 hashes, import the actual
+  dependencies, probe the server and run a synthetic separation before activation.
+  The first supported profile includes audio-separator 0.47's Roformer overlap fix
+  and verified BS-Roformer-SW / HTDemucs 6-stem assets.
+- Preserve the working installation and a rollback target. Updates wait for active
+  jobs and downloads; an older server without drain support waits for an explicit
+  stop. Progress, cancellation, prepared updates and interrupted-operation recovery
+  are visible in Settings. Existing songs change only when explicitly reprocessed.
+- Select a supported CPU or NVIDIA CUDA installation without GPU-model-specific
+  assumptions. Unsupported dependency/model combinations fail before activation.
+  The remote server, Docker and opt-in in-process engine retain their existing paths.
+
 ## 0.6.0
 
 ### Re-align guards its timings, not just its words ([#27](https://github.com/got-feedBack/feedBack-plugin-stem-splitter/issues/27))

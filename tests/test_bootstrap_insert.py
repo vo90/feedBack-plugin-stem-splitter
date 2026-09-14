@@ -76,7 +76,7 @@ class BootstrapInsertLine(unittest.TestCase):
         lines = src.splitlines(keepends=True)
         head = ds._bootstrap_insert_line(src)
         patched = "".join(lines[:head]) + boot + "".join(lines[head:])
-        ns: dict = {}
+        ns: dict = {"__file__": "run_demucs.py"}
         exec(compile(patched, "run_demucs.py", "exec"), ns)
         self.assertEqual(ns["__doc__"], "Driver.")
 

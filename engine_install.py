@@ -266,8 +266,57 @@ def _build_failure_hint(engine: str, output_tail: str) -> str:
     return ""
 
 
+# Used only for cancellable managed-runtime installs. The host can crash while
+# pip is building a wheel, so the worker itself must watch its parent as well as
+# accepting cancellation from the live host.
+_MANAGED_PARENT_WATCH = r'''
+import os, runpy, signal, subprocess, sys, threading, time
+parent = int(os.environ['STEM_SPLITTER_INSTALL_PARENT_PID'])
+def die():
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill','/PID',str(os.getpid()),'/T','/F'],
+                           capture_output=True, timeout=10,
+                           creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        elif os.getpgid(0) == os.getpid():
+            os.killpg(os.getpid(), signal.SIGKILL)
+    finally:
+        os._exit(1)
+if os.name == 'nt':
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE,wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x00100000, False, parent)
+    if not handle:
+        raise RuntimeError('Installer parent disappeared before preparation began')
+    def watch():
+        try:
+            kernel.WaitForSingleObject(handle, 0xFFFFFFFF)
+        finally:
+            kernel.CloseHandle(handle)
+        die()
+else:
+    def watch():
+        while os.getppid() == parent:
+            time.sleep(.25)
+        die()
+threading.Thread(target=watch, daemon=True).start()
+'''
+
+_MANAGED_PIP_WRAPPER = _MANAGED_PARENT_WATCH + r'''
+sys.argv = ['pip', *sys.argv[1:]]
+runpy.run_module('pip', run_name='__main__')
+'''
+
+
 def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: ProgressCB,
-               base: float, span: float, pkg_count: int = 1) -> None:
+               base: float, span: float, pkg_count: int = 1,
+               cancel_cb: Callable[[], None] | None = None) -> None:
     """Run one ``pip install`` transaction, streaming its output as progress events.
 
     Shared by the plugin's engine installer (``--target {config_dir}/engine``) and
@@ -294,9 +343,15 @@ def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: Pr
     collected = 0
     local = 0.02
     tail: list[str] = []
+    if cancel_cb:
+        cancel_cb()
+        env["STEM_SPLITTER_INSTALL_PARENT_PID"] = str(os.getpid())
+        cmd = [python_exe, "-u", "-c", _MANAGED_PIP_WRAPPER, "install", "--progress-bar", "off", *pip_args]
+    group = ({"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+             if os.name == "nt" else {"start_new_session": True}) if cancel_cb else {}
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env=env,
+        text=True, bufsize=1, env=env, **group,
     )
 
     # Watchdog: a stalled download would otherwise block on readline()/wait()
@@ -305,51 +360,89 @@ def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: Pr
     # cap — a legitimate multi-GB torch download is slow but never silent.)
     last_output = [time.monotonic()]
     stalled = threading.Event()
+    canceled: list[BaseException] = []
+
+    def terminate() -> None:
+        # The updater's pip runs in its own process group: wheel builders must
+        # not survive cancellation with the candidate directory held open.
+        try:
+            if cancel_cb and os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               capture_output=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            elif cancel_cb:
+                import signal
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            # taskkill can return an error without raising. Always terminate the
+            # owned parent too before waiting, including restricted hosts.
+            if proc.poll() is None:
+                proc.kill()
 
     def _watchdog() -> None:
         while proc.poll() is None:
+            if cancel_cb:
+                try:
+                    cancel_cb()
+                except BaseException as exc:
+                    canceled.append(exc)
+                    terminate()
+                    return
             if time.monotonic() - last_output[0] > _PIP_STALL_TIMEOUT:
                 stalled.set()
                 log.warning("stem_splitter: pip produced no output for %ss - killing it",
                             _PIP_STALL_TIMEOUT)
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+                terminate()
                 return
-            time.sleep(5)
+            time.sleep(0.25 if cancel_cb else 5)
 
     threading.Thread(target=_watchdog, name="stem_splitter-pip-watchdog",
                      daemon=True).start()
 
-    assert proc.stdout is not None
-    for raw in proc.stdout:
-        last_output[0] = time.monotonic()
-        line = raw.rstrip()
-        if not line:
-            continue
-        tail.append(line)
-        if len(tail) > 40:
-            tail.pop(0)
-        low = line.lower()
-        phase = ""
-        if low.startswith("collecting ") or low.startswith("requirement already"):
-            collected += 1
-            local = min(0.70, 0.02 + (collected / total) * 0.68)
-            phase = "Resolving / downloading"
-        elif "downloading " in low:
-            phase = "Downloading"
-        elif low.startswith("building wheel") or "building wheels" in low:
-            phase = "Building"
-        elif low.startswith("installing collected packages"):
-            local = 0.85
-            phase = "Installing"
-        elif low.startswith("successfully installed"):
-            local = 0.99
-            phase = "Finalizing"
-        emit(line, local, phase)
-
-    rc = proc.wait()
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            last_output[0] = time.monotonic()
+            line = raw.rstrip()
+            if not line:
+                continue
+            tail.append(line)
+            if len(tail) > 40:
+                tail.pop(0)
+            low = line.lower()
+            phase = ""
+            if low.startswith("collecting ") or low.startswith("requirement already"):
+                collected += 1
+                local = min(0.70, 0.02 + (collected / total) * 0.68)
+                phase = "Resolving / downloading"
+            elif "downloading " in low:
+                phase = "Downloading"
+            elif low.startswith("building wheel") or "building wheels" in low:
+                phase = "Building"
+            elif low.startswith("installing collected packages"):
+                local = 0.85
+                phase = "Installing"
+            elif low.startswith("successfully installed"):
+                local = 0.99
+                phase = "Finalizing"
+            emit(line, local, phase)
+        rc = proc.wait()
+    finally:
+        # A progress callback can raise (including cancellation) while pip is
+        # still writing. Do not leave it or a wheel-builder holding this tree.
+        if proc.poll() is None:
+            terminate()
+        proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
+    if canceled:
+        raise canceled[0]
+    if cancel_cb:
+        cancel_cb()
     if stalled.is_set():
         raise RuntimeError(
             f"pip stalled while installing {label} (no output for "

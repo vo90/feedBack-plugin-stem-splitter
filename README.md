@@ -10,8 +10,9 @@ Three ways to run, picked in the plugin's **Settings**:
 
 - **Managed local server (easiest)** — the plugin can install and run
   [`got-feedBack/feedBack-demucs-server`](https://github.com/got-feedBack/feedBack-demucs-server)
-  for you. One click: **Install server + models (~5 GB)** downloads its dependencies
-  and the model weights, then starts it. While it's running the plugin uses it
+  for you. **Prepare server installation** checks available versions, then **Update
+  server, libraries and models** downloads and validates a compatible installation. Use **Start** when ready.
+  While it's running the plugin uses it
   automatically. See [Local demucs server](#local-demucs-server) below.
 - **Docker container** — if you run feedBack in Docker, the plugin can't install a server
   on your host (a container can't start a process outside itself). Instead it gives you a
@@ -68,18 +69,47 @@ machine, so you don't have to stand one up yourself.
 
 | Control | What it does |
 |---|---|
-| **Install server + models (~5 GB)** | Downloads the server source, installs its Python dependencies, downloads the model weights, and starts it. The **only** thing that downloads anything. |
+| **Prepare server installation** / **Check for updates** | Checks the selected source revision, supported library versions and verified stem-model catalog. Shows installed and available versions without installing anything. |
+| **Update server, libraries and models** | Downloads a candidate server, resolves compatible dependencies, verifies the models and runs actual import, health and separation checks before activation. |
+| **Cancel update** | Cancels preparation while keeping the working installation. Activation itself must finish or roll back. |
+| **Apply prepared update** | Activates a validated candidate after an older server has stopped. Starting the server also activates a pending candidate. |
+| **Restore previous version** | Returns to the retained working generation. |
+| **Discard prepared update** | Removes an inactive failed or canceled candidate so preparation can be retried. |
 | **Start** / **Stop** | Runs it / kills it (and its worker processes). |
 | **Test status** | Probes `/health` — device, GPU, per-model warmup state. |
 | **Uninstall server** | Removes the source, its dependencies **and its downloaded weights**. |
 
-Status is shown as colored chips (running, models downloaded, per-model warmup), which
-update live while the weights are downloading.
+Status includes component versions, download/install progress, errors, pending activation
+and interrupted-operation recovery. A stopped server stays stopped after an update.
+For a running server that supports coordinated draining, new work pauses while current
+jobs and downloads finish, then the replacement starts. A legacy server stays running
+until you explicitly stop it; its prepared replacement waits safely.
+
+Updates use the **latest stable versions within the selected server's published
+compatibility profile**. A newer package outside that profile is reported but is not
+installed blindly. The complete dependency graph is resolved during preparation;
+the lightweight version check alone cannot certify every transitive dependency.
+The first model catalog covers `bs_roformer_sw` and `htdemucs_6s`. New model revisions
+must be published in the catalog with verified hashes. An upstream upload by itself
+does not automatically become a supported update.
+
+Each candidate has separate source, libraries and model copies. The previous generation
+is retained for rollback, so sufficient free disk space is required. Existing legacy
+weights can be reused after full hash verification. Arbitrary remote models and
+servers without a compatible catalog remain usable through their existing paths.
+
+**Updating does not modify existing song stems.** Explicitly re-split a song to use
+the updated model and libraries. Replace all relevant generated stems together when
+comparing separation quality; replacing only the guitar file cannot remove guitar
+that leaked into the other instrument files. This update does not guarantee that
+every song will separate cleanly.
 
 **Start with the app** (on by default, no-op until the server is installed) starts it
 in the background on launch. This never slows startup and never downloads:
 
-- weights already on disk → start **with warmup** (a RAM load — the server comes up
+- verified managed generation → start without downloading auxiliary transcription
+  models; the selected stem model was already executed during installation
+- legacy weights already on disk → start **with warmup** (a RAM load — the server comes up
   warm, so the first split is fast)
 - weights absent → start with `--skip-warmup`, so launching can't trigger the ~5 GB fetch
 
@@ -89,24 +119,27 @@ does (and your own `demucs_server_url` is left untouched).
 
 ### GPU (CUDA)
 
-**Plain `pip install torch` gives the CPU-only wheel** — so a naive install leaves an
-NVIDIA card completely idle and every split runs at CPU speed (minutes instead of
-seconds). The installer therefore:
+Use **GPU (CUDA)** for a supported NVIDIA installation or leave it off for CPU
+execution. The updater uses the same compatibility and execution checks across
+GPU models; there is no RTX 4080-specific path. It:
 
 - **detects an NVIDIA GPU** (via `nvidia-smi`) and ticks **Use GPU (CUDA)** by default
   when one is present;
 - installs the **CUDA torch build** (`torch==2.8.0+cu128` from PyTorch's index) — pinned
-  *inside the same single pip resolve* as everything else, so it can't reintroduce a
+  inside the same pip resolve as the profile's dependencies, so it cannot introduce a
   conflicting dependency tree;
 - **verifies after installing** that `torch.version.cuda` is actually set and a GPU is
   visible, rather than trusting the pin.
 
-**No CUDA Toolkit is needed** — the wheels bundle the CUDA runtime; you just need a
-recent NVIDIA driver. The GPU build is a bigger download (~5.5 GB vs ~3 GB).
+The wheels bundle the CUDA runtime; a compatible NVIDIA driver and enough device
+memory are still required. GPU installations are larger than CPU installations.
 
-If you already installed the CPU build on a GPU machine, the status shows
-**"CPU-only build — GPU idle"** and the button offers **Reinstall with GPU**. Override the
-CUDA build with `STEM_SPLITTER_CUDA_TAG` (e.g. `cu126`) if `cu128` doesn't suit your driver.
+To change an existing installation, select the GPU option and supported CUDA build
+in Settings, check again, then apply the new candidate. The first profile supports
+`cu126`, `cu128` and `cu129`; future profiles can change the supported builds. The
+candidate must pass a CUDA execution probe before activation. CPU remains available
+on machines without a supported CUDA configuration; this change adds no new AMD or
+Intel acceleration backend.
 
 ### Requirements
 

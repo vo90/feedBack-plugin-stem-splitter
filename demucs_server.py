@@ -50,6 +50,8 @@ import sys
 import threading
 import time
 import zipfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -58,6 +60,30 @@ import engine_install
 log = logging.getLogger("feedBack.plugin.stem_splitter")
 
 ProgressCB = Optional[Callable[[dict], None]]
+
+# Candidate validation must not redirect the running server or another thread.
+_INSTALL_OVERRIDE: ContextVar[Path | None] = ContextVar("stem_install_root", default=None)
+_CACHE_OVERRIDE: ContextVar[Path | None] = ContextVar("stem_cache_root", default=None)
+
+
+@contextmanager
+def installation_context(root: Path, cache: Path | None = None):
+    """Use an explicit candidate root in this thread only."""
+    root_token = _INSTALL_OVERRIDE.set(Path(root))
+    cache_token = _CACHE_OVERRIDE.set(Path(cache) if cache else None)
+    try:
+        yield
+    finally:
+        _CACHE_OVERRIDE.reset(cache_token)
+        _INSTALL_OVERRIDE.reset(root_token)
+
+
+def installation_root(config_dir: Path) -> Path:
+    override = _INSTALL_OVERRIDE.get()
+    if override is not None:
+        return override
+    import runtime_update
+    return runtime_update.active_root(config_dir)
 
 SOURCE_REPO = "got-feedBack/feedBack-demucs-server"
 # Ref to install from. Resolved to an immutable commit SHA before download, so an
@@ -69,6 +95,9 @@ DEFAULT_SOURCE_REF = os.environ.get("STEM_SPLITTER_SERVER_REF", "main")
 SOURCE_REF = DEFAULT_SOURCE_REF   # back-compat alias
 # The only files the server actually needs to run.
 SOURCE_FILES = ("server.py", "run_demucs.py", "run_roformer.py", "requirements.txt")
+# Explicitly permitted additions to newer source archives. Legacy source updates
+# still accept their original four-file contract.
+RUNTIME_SOURCE_FILES = SOURCE_FILES + ("runtime-manifest.json", "managed_runtime.py")
 
 DEFAULT_PORT = 7865
 DEFAULT_MODEL = "bs_roformer_sw"   # what the plugin splits with; also makes warmup prefetch it
@@ -152,10 +181,10 @@ _DIFFQ_CANDIDATES = ("diffq-fixed>=0.2", "diffq>=0.2")
 TORCH_VERSION = os.environ.get("STEM_SPLITTER_TORCH_VERSION", "2.8.0")
 DEFAULT_CUDA_TAG = os.environ.get("STEM_SPLITTER_CUDA_TAG", "cu128")
 CUDA_TAG = DEFAULT_CUDA_TAG   # back-compat alias
-# Builds PyTorch actually publishes. cu128 needs a recent driver; cu126/cu121 are the
-# fallbacks for older ones. Offered in the Advanced section because "which CUDA build
+# Builds published for the bundled compatibility profile's PyTorch 2.8 family.
+# cu126 supports an older driver range than cu128/cu129. Offered in Advanced because "which CUDA build
 # works" is driver-dependent and we can't reliably guess it.
-CUDA_TAGS = ["cu128", "cu126", "cu121"]
+CUDA_TAGS = ["cu128", "cu126", "cu129"]
 
 
 def cuda_index(tag: str) -> str:
@@ -199,7 +228,7 @@ def detect_nvidia_gpu() -> dict | None:
 def install_info(config_dir: Path) -> dict:
     """What the last install actually produced (notably: GPU or CPU torch)."""
     try:
-        data = json.loads((server_dir(config_dir) / "install.json").read_text(encoding="utf-8"))
+        data = json.loads((installation_root(config_dir) / "install.json").read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -251,12 +280,13 @@ def _invalidate_running() -> None:
         _running_memo.clear()
 
 
-# Sizing the server dir means walking pylibs/ + cache/ - several GB once the weights
-# land. server_status() is polled every 5s by the settings page while models download,
-# so recomputing it each time would be a continuous disk scan for a number that barely
-# moves. Memoize it (and let the caller skip it entirely).
+# Sizing all retained generations can take minutes on Windows. Status and lifecycle
+# responses must never wait for that display-only scan. Keep one refresh per profile
+# in the background, serving the last known total until it completes.
 _disk_memo: dict[str, tuple[float, int]] = {}
 _disk_lock = threading.Lock()
+_disk_refreshing: set[str] = set()
+_disk_revision: dict[str, int] = {}
 _DISK_TTL = 30.0  # seconds
 
 
@@ -276,17 +306,49 @@ def _dir_size(p: Path) -> int:
     return total
 
 
+def _invalidate_disk_size(config_dir: Path) -> None:
+    key = str(config_dir)
+    with _disk_lock:
+        _disk_memo.pop(key, None)
+        _disk_revision[key] = _disk_revision.get(key, 0) + 1
+        # An older scan may still be walking a changed/deleted tree. Keep its
+        # single-flight slot occupied, but prevent it publishing a stale total.
+
+
 def _server_disk_bytes(config_dir: Path) -> int:
     key = str(config_dir)
     now = time.monotonic()
     with _disk_lock:
         hit = _disk_memo.get(key)
+        previous = hit[1] if hit else 0
         if hit and now - hit[0] < _DISK_TTL:
-            return hit[1]
-    size = _dir_size(server_dir(config_dir))
-    with _disk_lock:
-        _disk_memo[key] = (now, size)
-    return size
+            return previous
+        if key in _disk_refreshing:
+            return previous
+        _disk_refreshing.add(key)
+        revision = _disk_revision.get(key, 0)
+
+    def refresh() -> None:
+        size = previous
+        try:
+            size = _dir_size(server_dir(config_dir))
+        except Exception:
+            # Discard/uninstall can remove a directory during enumeration. Keep
+            # the last total and retry after the TTL, without breaking status.
+            log.debug("stem_splitter: disk-size refresh failed", exc_info=True)
+        finally:
+            with _disk_lock:
+                if _disk_revision.get(key, 0) == revision:
+                    _disk_memo[key] = (time.monotonic(), size)
+                _disk_refreshing.discard(key)
+
+    try:
+        threading.Thread(target=refresh, name="stem_splitter-disk-size", daemon=True).start()
+    except Exception:
+        with _disk_lock:
+            _disk_refreshing.discard(key)
+        log.debug("stem_splitter: could not start disk-size refresh", exc_info=True)
+    return previous
 
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -296,13 +358,23 @@ def server_dir(config_dir: Path) -> Path:
 
 
 def src_dir(config_dir: Path) -> Path:
-    return server_dir(config_dir) / "src"
+    return installation_root(config_dir) / "src"
 
 
 def pylibs_dir(config_dir: Path) -> Path:
     """The server's dependency tree (pip --target). Portable across every packaged
     platform, unlike a venv (see the module docstring)."""
-    return server_dir(config_dir) / "pylibs"
+    root = installation_root(config_dir)
+    # A source/model-only generation can reuse a previously verified dependency
+    # tree. Its receipt is generated locally, and the path remains contained.
+    try:
+        receipt = json.loads((root / "receipt.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        receipt = {}
+    if receipt.get("dependency_dir"):
+        import runtime_update
+        return runtime_update.owned_path(config_dir, receipt["dependency_dir"])
+    return root / "pylibs"
 
 
 def launcher_path(config_dir: Path) -> Path:
@@ -310,7 +382,7 @@ def launcher_path(config_dir: Path) -> Path:
 
 
 def cache_dir(config_dir: Path) -> Path:
-    return server_dir(config_dir) / "cache"
+    return _CACHE_OVERRIDE.get() or server_dir(config_dir) / "cache"
 
 
 def state_file(config_dir: Path) -> Path:
@@ -405,7 +477,7 @@ def manage_advisory(config_dir: Path) -> str:
     return ""
 
 
-def models_downloaded(config_dir: Path) -> bool:
+def models_downloaded(config_dir: Path, model: str = DEFAULT_MODEL) -> bool:
     """Are the split model weights already on disk?
 
     This is the gate that decides warmup-vs-skip-warmup at auto-start: warming up
@@ -421,6 +493,9 @@ def models_downloaded(config_dir: Path) -> bool:
     So: all of them, or none of them. If anything is missing we start with --skip-warmup and
     nothing is fetched until the user explicitly asks for it.
     """
+    if (installation_root(config_dir) / "receipt.json").is_file():
+        import runtime_update
+        return runtime_update.model_presence(config_dir).get(model, False)
     cache = cache_dir(config_dir)
     return _has_roformer(cache) and _has_whisper(cache) and _has_aligner(cache)
 
@@ -605,11 +680,15 @@ def _migrate_torch_home(cache: Path) -> None:
                     old, new, e)
 
 
-def missing_models(config_dir: Path) -> list[str]:
+def missing_models(config_dir: Path, model: str = DEFAULT_MODEL) -> list[str]:
     """Which of them are absent — so the UI can name them, instead of saying 'not ready'."""
     cache = cache_dir(config_dir)
     out: list[str] = []
-    if not _has_roformer(cache):
+    if (installation_root(config_dir) / "receipt.json").is_file():
+        import runtime_update
+        if not runtime_update.model_presence(config_dir).get(model, False):
+            out.append(model)
+    elif not _has_roformer(cache):
         out.append("bs_roformer_sw")
     if not _has_whisper(cache):
         out.append("whisperx")
@@ -622,6 +701,7 @@ def missing_models(config_dir: Path) -> list[str]:
 # ORDER OF MAGNITUDE, so the user can tell "grab a coffee" from "this is quick".
 _MODEL_MB = {
     "bs_roformer_sw": 700,       # BS-Roformer-SW.ckpt
+    "htdemucs_6s": 55,
     "whisperx": 1500,            # faster-whisper medium
     "whisperx aligner": 360,     # wav2vec2 forced aligner
 }
@@ -660,7 +740,7 @@ def _norm_ref(ref: str | None) -> str:
 def source_meta(config_dir: Path) -> dict:
     """What source is actually installed (ref + commit)."""
     try:
-        data = json.loads((server_dir(config_dir) / "source.json").read_text(encoding="utf-8"))
+        data = json.loads((installation_root(config_dir) / "source.json").read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -698,7 +778,7 @@ def check_update(config_dir: Path, ref: str | None = None) -> dict:
 
 
 def _source_meta_file(config_dir: Path) -> Path:
-    return server_dir(config_dir) / "source.json"
+    return installation_root(config_dir) / "source.json"
 
 
 def _snapshot_source(config_dir: Path) -> Path:
@@ -786,6 +866,15 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
     A server that cannot import its own dependencies would only crash-loop, and the user must
     never end up worse off for having clicked a button meant to help them.
     """
+    # Generations are immutable. Retain the legacy endpoint without permitting a
+    # source-only update to overwrite an activated generation.
+    if _INSTALL_OVERRIDE.get() is None and (server_dir(config_dir) / "active.json").exists():
+        import runtime_update
+        plan = runtime_update.check_updates(config_dir, ref=ref, model=model)
+        if not plan.get("can_update"):
+            raise RuntimeError(plan.get("reason") or "No compatible runtime update is available")
+        return runtime_update.apply_update(config_dir, plan["plan_id"], port=port,
+                                           device=device, model=model, progress_cb=progress_cb)
     if not installed(config_dir):
         raise RuntimeError("the server isn't installed, so there is nothing to update")
 
@@ -979,7 +1068,7 @@ def download_source(config_dir: Path, ref: str | None = None,
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
         for member in zf.namelist():
             name = member.rsplit("/", 1)[-1]
-            if name in SOURCE_FILES and not member.endswith("/"):
+            if name in RUNTIME_SOURCE_FILES and not member.endswith("/"):
                 (sdir / name).write_bytes(zf.read(member))
                 got.append(name)
                 _emit(progress_cb, f"  extracted {name}", 0.06, "Downloading source")
@@ -989,7 +1078,7 @@ def download_source(config_dir: Path, ref: str | None = None,
         raise RuntimeError(f"server source archive is missing {missing}")
 
     try:
-        (server_dir(config_dir) / "source.json").write_text(
+        _source_meta_file(config_dir).write_text(
             json.dumps({"repo": SOURCE_REPO, "ref": ref, "commit": commit,
                         "installed_at": time.time()}, indent=2), encoding="utf-8")
     except OSError as e:
@@ -1213,8 +1302,12 @@ _BOOTSTRAP_TEMPLATE = (
     "# (ignored by the packaged Windows embeddable Python), so point it at the\n"
     "# plugin-managed dependency tree explicitly.\n"
     "import sys as _ss_sys\n"
+    "from pathlib import Path as _ss_Path\n"
     "if {pylibs!r} not in _ss_sys.path:\n"
     "    _ss_sys.path.insert(0, {pylibs!r})\n"
+    "_ss_source = str(_ss_Path(__file__).resolve().parent)\n"
+    "if _ss_source not in _ss_sys.path:\n"
+    "    _ss_sys.path.insert(0, _ss_source)\n"
     "# --- end stem_splitter path bootstrap ---\n"
 )
 
@@ -1376,6 +1469,8 @@ def install_server(config_dir: Path, gpu: bool = False, ref: str | None = None,
 
     Explicit-only (the "Install server" button). Several GB of wheels.
     """
+    if _INSTALL_OVERRIDE.get() is None and installed(config_dir):
+        raise RuntimeError("The server is already installed. Use Update runtime to prepare a safe replacement.")
     ok, reason = can_manage(config_dir)
     if not ok:
         raise RuntimeError(reason)
@@ -1455,10 +1550,9 @@ def install_server(config_dir: Path, gpu: bool = False, ref: str | None = None,
     _install_diffq(target, progress_cb,
                    base=0.12 + (len(steps) / n) * 0.86, span=0.86 / n)
 
-    with _disk_lock:
-        _disk_memo.clear()   # the tree just changed materially
+    _invalidate_disk_size(config_dir)
     try:
-        (server_dir(config_dir) / "install.json").write_text(json.dumps({
+        (installation_root(config_dir) / "install.json").write_text(json.dumps({
             "gpu": bool(gpu),
             "torch": f"{TORCH_VERSION}+{tag}" if gpu else "cpu",
             "cuda_tag": tag if gpu else None,
@@ -1582,8 +1676,7 @@ def uninstall_server(config_dir: Path) -> dict:
     except Exception as e:
         log.warning("stem_splitter: stop before uninstall failed: %s", e)
     shutil.rmtree(server_dir(config_dir), ignore_errors=True)
-    with _disk_lock:
-        _disk_memo.clear()
+    _invalidate_disk_size(config_dir)
     try:
         state_file(config_dir).unlink(missing_ok=True)
     except OSError as e:
@@ -1639,6 +1732,15 @@ def _server_env(config_dir: Path) -> dict:
     # Python ignores this (isolated ._pth mode) - patch_driver_scripts() is what
     # covers that case - but it's correct everywhere else and costs nothing.
     env["PYTHONPATH"] = str(pylibs_dir(config_dir))
+
+    receipt = installation_root(config_dir) / "receipt.json"
+    if receipt.is_file():
+        import runtime_update
+        env["FEEDBACK_RUNTIME_RECEIPT"] = str(receipt)
+        env["FEEDBACK_MANAGEMENT_TOKEN"] = runtime_update.management_token(config_dir)
+    else:
+        env.pop("FEEDBACK_RUNTIME_RECEIPT", None)
+        env.pop("FEEDBACK_MANAGEMENT_TOKEN", None)
 
     cache = cache_dir(config_dir)
     cache.mkdir(parents=True, exist_ok=True)
@@ -1756,7 +1858,9 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
         return server_status(config_dir, model=model)
 
     if warmup is None:
-        warmup = models_downloaded(config_dir)
+        # Receipt-managed stem models are ready without warming every unrelated
+        # lyrics model. Ordinary start must never pull missing auxiliary weights.
+        warmup = False if (installation_root(config_dir) / "receipt.json").is_file() else models_downloaded(config_dir)
 
     # Rewrite the launcher + re-bootstrap the driver scripts on every start: they
     # bake in the pylibs path, the config dir can move, and this repairs an install
@@ -1801,7 +1905,8 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     )
     with _proc_lock:
         _proc = proc
-    _write_state(config_dir, {"pid": proc.pid, "port": port, "started_at": time.time()})
+    _write_state(config_dir, {"pid": proc.pid, "port": port, "device": device,
+                             "model": model, "started_at": time.time()})
     _invalidate_running()
 
     tail: list[str] = []
@@ -2021,6 +2126,33 @@ def _posix_kill_tree(pid: int) -> None:
         pass
 
 
+def _pid_alive(pid: int) -> bool:
+    """Probe existence without signalling a possibly reused Windows PID."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+        if not handle:
+            return ctypes.get_last_error() != 87  # only INVALID_PARAMETER proves gone
+        try:
+            return kernel.WaitForSingleObject(handle, 0) != 0  # WAIT_OBJECT_0 = exited
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # inability to inspect is not proof of termination
+
+
 def stop_server(config_dir: Path) -> dict:
     """Kill the server AND its children (it spawns run_demucs.py / run_roformer.py
     workers - terminating only the parent would orphan them)."""
@@ -2064,7 +2196,8 @@ def stop_server(config_dir: Path) -> dict:
         try:
             if os.name == "nt":
                 subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, timeout=30,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             else:
                 _posix_kill_tree(int(pid))
         except Exception as e:
@@ -2075,6 +2208,15 @@ def stop_server(config_dir: Path) -> dict:
             p.wait(timeout=5)  # reap
         except Exception:
             pass
+
+    if pid and ((p is not None and p.poll() is None) or _pid_alive(int(pid))):
+        # A failed kill must retain the handle/state, otherwise is_running()
+        # would falsely report success and an updater could promote over it.
+        with _proc_lock:
+            if p is not None and p.poll() is None:
+                _proc = p
+        _invalidate_running()
+        raise RuntimeError("The managed server process did not stop. Its runtime was preserved; retry Stop before updating.")
 
     try:
         state_file(config_dir).unlink(missing_ok=True)
@@ -2165,6 +2307,14 @@ def server_status(config_dir: Path, model: str = DEFAULT_MODEL) -> dict:
         "whisperx": _has_whisper(cache),
         "whisperx_aligners": _has_aligner(cache),
     }
+    managed_generation = (installation_root(config_dir) / "receipt.json").is_file()
+    if managed_generation:
+        import runtime_update
+        present.update(runtime_update.model_presence(config_dir))
+        # An absent legacy bs_roformer cache says nothing about another selected
+        # generation model. Each catalog entry has its own verified asset set.
+        if model not in present:
+            present[model] = False
     return {
         "installed": installed(config_dir),
         "running": running,
@@ -2172,7 +2322,8 @@ def server_status(config_dir: Path, model: str = DEFAULT_MODEL) -> dict:
         "port": port,
         "url": url if running else None,
         "health": health,
-        "models_downloaded": all(present.values()),
+        "models_downloaded": present.get(model, False) if managed_generation else all(present.values()),
+        "managed_generation": managed_generation,
         "models_present": present,
         "models_ready": models_ready,
         "server_dir": str(server_dir(config_dir)),

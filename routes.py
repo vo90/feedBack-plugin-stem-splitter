@@ -19,12 +19,13 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 import demucs_server
 import docker_sidecar
 import engine_install
 import realign
+import runtime_update
 
 # Hoisted: ruff B008 rightly objects to Body() being called in an argument
 # default. Both sidecar routes take an optional JSON body.
@@ -90,6 +91,9 @@ class JobManager:
         self.jobs: dict[str, dict] = {}
         self.q: "queue.Queue[str]" = queue.Queue()
         self.paused = threading.Event()
+        # Independent of the user's pause control: an unpause must never dispatch
+        # a job into the short window where its managed server is being replaced.
+        self._runtime_dispatch_paused = threading.Event()
         self.lock = threading.Lock()
         self._clients: set[asyncio.Queue] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -383,11 +387,18 @@ class JobManager:
     def _worker_loop(self) -> None:
         while True:
             job_id = self.q.get()
-            while self.paused.is_set():
-                time.sleep(0.3)
-            with self.lock:
-                job = self.jobs.get(job_id)
-            if not job or job.get("status") != "queued":
+            while True:
+                # Reserve the job under the same lock as the updater's admission
+                # gate. Otherwise a queued job can start after the idle check.
+                with self.lock:
+                    job = self.jobs.get(job_id)
+                    if not job or job.get("status") != "queued" or job_id in self._cancel:
+                        break
+                    if not self.paused.is_set() and not self._runtime_dispatch_paused.is_set():
+                        job.update(status="running", progress=0.0, message="Starting")
+                        break
+                time.sleep(0.1)
+            if not job or job.get("status") not in ("queued", "running"):
                 # A job canceled while still queued already had its status flipped;
                 # discard its id here so it doesn't leak in `_cancel` forever.
                 self._cancel.discard(job_id)
@@ -530,7 +541,8 @@ class JobManager:
     def snapshot(self) -> dict:
         with self.lock:
             jobs = sorted(self.jobs.values(), key=lambda j: j.get("created", 0))
-        return {"type": "jobs", "paused": self.paused.is_set(), "jobs": jobs,
+        return {"type": "jobs", "paused": self.paused.is_set(),
+                "runtime_paused": self._runtime_dispatch_paused.is_set(), "jobs": jobs,
                 "install": self._install, "server": self._server}
 
     def broadcast_snapshot(self, throttle: bool = False) -> None:
@@ -555,6 +567,24 @@ class JobManager:
         self._push(msg)
 
     # ── managed demucs server ────────────────────────────────────────────────
+    def wait_for_runtime_activation(self) -> None:
+        """Close local admission and let the current job finish before cutover.
+
+        Other clients are covered by the server's drain protocol. The caller
+        releases this gate in finally, including when staging/draining fails.
+        """
+        with self.lock:
+            self._runtime_dispatch_paused.set()
+        self.broadcast_snapshot()
+        while True:
+            with self.lock:
+                running = any(j.get("status") == "running" for j in self.jobs.values())
+            if not running:
+                return
+            if runtime_update.status(self.config_dir).get("cancel_requested"):
+                raise runtime_update.UpdateCancelled("Update canceled while waiting for the current job.")
+            time.sleep(0.1)
+
     def run_server_op(self, op: str, fn) -> bool:
         """Run a demucs-server lifecycle op (install / start / prepare_models) on a
         daemon thread, streaming progress over the WS. Same contract as the engine
@@ -576,12 +606,15 @@ class JobManager:
         def _run() -> None:
             def cb(ev: dict) -> None:
                 st = {"active": True, "op": op, "line": ev.get("line", ""),
-                      "pct": ev.get("pct", 0.0), "phase": ev.get("phase", "")}
+                      "pct": ev.get("pct", 0.0), "phase": ev.get("phase", ""),
+                      "state": ev.get("state")}
                 self._server = st
                 self.push_event({"type": "server", **st})
             try:
                 status = fn(cb)
-                self._server = {"active": False, "op": op, "pct": 1.0, "phase": "Done"}
+                phase = status.get("phase", "Done") if op.startswith("runtime_") else "Done"
+                pct = status.get("pct", 1.0) if op.startswith("runtime_") else 1.0
+                self._server = {"active": False, "op": op, "pct": pct, "phase": phase}
                 self.push_event({"type": "server_done", "op": op, "status": status})
             except Exception as e:
                 self.log.warning("stem_splitter: server op %s failed: %s", op, e)
@@ -595,6 +628,9 @@ class JobManager:
                 # we've already reported the op as done). Safe to do unconditionally
                 # because the lock guarantees no other op is in flight.
                 demucs_server.clear_stream_cb()
+                if op.startswith("runtime_"):
+                    self._runtime_dispatch_paused.clear()
+                    self.broadcast_snapshot()
                 with self._server_op_lock:
                     self._server_op_active = None
         threading.Thread(target=_run, name=f"stem_splitter-server-{op}", daemon=True).start()
@@ -629,7 +665,8 @@ class JobManager:
         Each route is only ours to set up if it points at OUR managed server. Someone else's
         server is their business.
         """
-        missing_all = demucs_server.missing_models(self.config_dir)
+        model = str(self.read_settings().get("remote_model") or demucs_server.DEFAULT_MODEL)
+        missing_all = demucs_server.missing_models(self.config_dir, model=model)
         if not missing_all:
             return None
 
@@ -647,11 +684,14 @@ class JobManager:
             if lyrics_is_ours:
                 wanted += [m for m in missing_all if m in self._ALIGN_MODELS]
             if split_is_ours:
-                wanted += [m for m in missing_all if m in self._SEPARATOR_MODELS]
+                wanted += [m for m in missing_all if m == model]
         elif split_is_ours:
-            # A split. Ask about everything the server would warm — the separator is what it
-            # loads, and this is the path that has always prompted for the full set.
-            wanted = list(missing_all)
+            # Managed generations do not prefetch unrelated lyrics models on
+            # startup. Preserve the legacy warmup contract for old installations.
+            if runtime_update.inventory(self.config_dir).get("legacy", True):
+                wanted = list(missing_all)
+            else:
+                wanted = [m for m in missing_all if m == model]
 
         # Preserve missing_models()' order, and don't repeat a model both routes want.
         missing = [m for m in missing_all if m in set(wanted)]
@@ -840,6 +880,15 @@ def setup(app: FastAPI, context: dict) -> None:
     @app.post(f"{P}/server/start")
     def post_server_start():
         port, device, model = _server_opts()
+        if runtime_update.status(mgr.config_dir).get("pending_activation"):
+            def start_pending(cb):
+                return runtime_update.activate_pending(
+                    mgr.config_dir, port=port, device=device, model=model,
+                    start_after=True, progress_cb=cb,
+                    before_activate=mgr.wait_for_runtime_activation)
+            if not mgr.run_server_op("runtime_activate", start_pending):
+                return _busy()
+            return {"ok": True, "started": "runtime_activate"}
         # warmup=None -> warm up only if the weights are already on disk, so a
         # start can never trigger the big download.
         if not mgr.run_server_op("start", lambda cb: demucs_server.start_server(
@@ -880,6 +929,78 @@ def setup(app: FastAPI, context: dict) -> None:
                 progress_cb=cb)):
             return _busy()
         return {"ok": True}
+
+    # Full managed runtime updates are separate from the legacy source-only API.
+    # All targets come from an on-disk checked plan, never executable package
+    # specifications, paths or model URLs submitted by the browser.
+    @app.get(f"{P}/server/runtime/inventory")
+    def get_runtime_inventory():
+        return runtime_update.inventory(mgr.config_dir)
+
+    @app.get(f"{P}/server/runtime/status")
+    def get_runtime_status():
+        state = runtime_update.status(mgr.config_dir)
+        return {**state, "busy": mgr._server_op_active}
+
+    @app.post(f"{P}/server/runtime/check")
+    def post_runtime_check(body: dict | None = _OPT_BODY):
+        if _op_in_flight():
+            return _busy()
+        settings = mgr.read_settings()
+        opts = body or {}
+        model = str(opts.get("model") or settings.get("remote_model") or demucs_server.DEFAULT_MODEL)
+        if model != str(settings.get("remote_model") or demucs_server.DEFAULT_MODEL):
+            return {"can_update": False, "state": "incompatible",
+                    "reason": "Save the selected split model before checking for updates."}
+        ref = str(opts.get("ref", settings.get("local_server_ref")) or "") or None
+        cuda_tag = str(opts.get("cuda_tag", settings.get("local_server_cuda_tag")) or "") or None
+        try:
+            return runtime_update.check_updates(
+                mgr.config_dir, ref=ref, model=model, gpu=_want_gpu(opts), cuda_tag=cuda_tag)
+        except (ValueError, RuntimeError) as exc:
+            # Checking is not installing. An unavailable catalog must not be
+            # represented as either an installed upgrade or "up to date".
+            return {"ok": False, "state": "unknown", "error": str(exc), "can_update": False}
+
+    @app.post(f"{P}/server/runtime/update")
+    def post_runtime_update(body: dict | None = _OPT_BODY):
+        plan_id = (body or {}).get("plan_id")
+        if not isinstance(plan_id, str) or not plan_id or len(plan_id) > 128:
+            raise HTTPException(status_code=400, detail="Check for updates before installing an update.")
+        port, device, model = _server_opts()
+        if not mgr.run_server_op("runtime_update", lambda cb: runtime_update.apply_update(
+                mgr.config_dir, plan_id, port=port, device=device, model=model,
+                progress_cb=cb, before_activate=mgr.wait_for_runtime_activation)):
+            return _busy()
+        return {"ok": True, "started": "runtime_update"}
+
+    @app.post(f"{P}/server/runtime/cancel")
+    def post_runtime_cancel():
+        return runtime_update.cancel_update(mgr.config_dir)
+
+    @app.post(f"{P}/server/runtime/activate")
+    def post_runtime_activate():
+        port, device, model = _server_opts()
+        if not mgr.run_server_op("runtime_activate", lambda cb: runtime_update.activate_pending(
+                mgr.config_dir, port=port, device=device, model=model, progress_cb=cb,
+                before_activate=mgr.wait_for_runtime_activation)):
+            return _busy()
+        return {"ok": True, "started": "runtime_activate"}
+
+    @app.post(f"{P}/server/runtime/rollback")
+    def post_runtime_rollback():
+        port, device, model = _server_opts()
+        if not mgr.run_server_op("runtime_rollback", lambda cb: runtime_update.rollback(
+                mgr.config_dir, port=port, device=device, model=model, progress_cb=cb,
+                before_activate=mgr.wait_for_runtime_activation)):
+            return _busy()
+        return {"ok": True, "started": "runtime_rollback"}
+
+    @app.post(f"{P}/server/runtime/discard")
+    def post_runtime_discard():
+        if not mgr.run_server_op("runtime_discard", lambda _cb: runtime_update.discard_candidate(mgr.config_dir)):
+            return _busy()
+        return {"ok": True, "started": "runtime_discard"}
 
     # ── managed sibling container (Docker socket) ────────────────────────────
     #
