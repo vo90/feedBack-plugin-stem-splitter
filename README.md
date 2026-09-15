@@ -11,7 +11,9 @@ Three ways to run, picked in the plugin's **Settings**:
 - **Managed local server (easiest)** — the plugin can install and run
   [`got-feedBack/feedBack-demucs-server`](https://github.com/got-feedBack/feedBack-demucs-server)
   for you. **Prepare server installation** checks available versions, then **Update
-  server, libraries and models** downloads and validates a compatible installation. Use **Start** when ready.
+  server, libraries and models** downloads and validates a compatible installation,
+  including its own verified FFmpeg/FFprobe pair; no system FFmpeg installation is
+  required. Use **Start** when ready.
   While it's running the plugin uses it
   automatically. See [Local demucs server](#local-demucs-server) below.
 - **Docker container** — if you run feedBack in Docker, the plugin can't install a server
@@ -69,8 +71,8 @@ machine, so you don't have to stand one up yourself.
 
 | Control | What it does |
 |---|---|
-| **Prepare server installation** / **Check for updates** | Checks the selected source revision, supported library versions and verified stem-model catalog. Shows installed and available versions without installing anything. |
-| **Update server, libraries and models** | Downloads a candidate server, resolves compatible dependencies, verifies the models and runs actual import, health and separation checks before activation. |
+| **Prepare server installation** / **Check for updates** | Checks the selected source revision, supported library versions, portable media tools and verified stem-model catalog. Shows installed and available versions without installing anything. |
+| **Update server, libraries and models** | Downloads a candidate server, installs its contained FFmpeg/FFprobe pair, resolves compatible dependencies, verifies the models and runs media, import, health and separation checks before activation. |
 | **Cancel update** | Cancels preparation while keeping the working installation. Activation itself must finish or roll back. |
 | **Apply prepared update** | Activates a validated candidate after an older server has stopped. Starting the server also activates a pending candidate. |
 | **Restore previous version** | Returns to the retained working generation. |

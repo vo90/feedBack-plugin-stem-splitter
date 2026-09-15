@@ -16,8 +16,10 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -27,11 +29,18 @@ import zipfile
 from email.parser import Parser
 from pathlib import Path, PurePosixPath
 from typing import Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
+# Keep the on-disk operation/activation protocol stable while independently
+# versioning the published server contract and immutable generation receipt.
+# Existing v1 pointers and receipts remain readable; newly prepared runtimes
+# consume manifest v2 and carry receipt v2 media-tool evidence.
 SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 2
 MANIFEST_NAME = "runtime-manifest.json"
 _ID = re.compile(r"^[a-zA-Z0-9_-]{1,100}$")
+_TOOLSET_ID = re.compile(r"^[a-zA-Z0-9_.-]{1,100}$")
 _SHA = re.compile(r"^[a-fA-F0-9]{64}$")
 _COMMIT = re.compile(r"^[a-fA-F0-9]{40}$")
 _LOCK = threading.RLock()
@@ -41,6 +50,11 @@ _TERMINAL = {"idle", "active", "current", "rolled_back", "canceled", "failed", "
 # Bound the wait to 1.585 seconds; never remove the destination to work around it.
 _REPLACE_RETRY_DELAYS = (.01, .025, .05, .1, .2, .4, .8)
 _WINDOWS_REPLACE_ERRORS = {5, 32, 33}  # access denied, sharing violation, lock violation
+_MEDIA_TOOL_NAMES = ("ffmpeg", "ffprobe")
+_MEDIA_PLATFORMS = {"win32", "linux", "darwin"}
+_MEDIA_ARCHES = {"x86_64", "arm64"}
+_MEDIA_ARCHIVE_FORMATS = {"zip", "tar.xz"}
+_MAX_MEDIA_TOOL_BYTES = 1024 ** 3
 
 
 class UpdateCancelled(RuntimeError):
@@ -223,6 +237,7 @@ def inventory(config_dir: Path) -> dict:
         source = _read(root / "source.json")
         generation_id = _active_id(config_dir)
         present = model_presence(config_dir)
+        media_tools = _media_tools_inventory(config_dir, root, receipt)
         models = {key: {"revision": value.get("revision"), "state": "verified" if present.get(key) else "damaged",
                         "engine": value.get("engine"), "stems": value.get("stems", [])}
                   for key, value in receipt.get("models", {}).items()}
@@ -247,11 +262,12 @@ def inventory(config_dir: Path) -> dict:
                 "ref": source.get("ref"), "profile_id": receipt.get("profile_id"),
                 "dependencies": versions, "audio_separator": versions.get("audio-separator"),
                 "models": models, "model_verification": "verified" if models and generation_id != "legacy" else "verification_pending",
+                "media_tools": media_tools,
                 "python": platform.python_version(), "platform": sys.platform,
                 "install_info": _read(root / "install.json"), "error": None}
     except Exception as exc:
-        return {"installed": False, "state": "damaged", "error": str(exc), "dependencies": {}, "models": {},
-                "source": ds.update_source_status(config_dir)}
+        return {"installed": False, "state": "damaged", "error": str(exc), "dependencies": {},
+                "models": {}, "media_tools": {}, "source": ds.update_source_status(config_dir)}
 
 
 def model_presence(config_dir: Path) -> dict[str, bool]:
@@ -267,6 +283,120 @@ def model_presence(config_dir: Path) -> dict[str, bool]:
         except (OSError, ValueError, KeyError):
             result[name] = False
     return result
+
+
+def _is_link_like(path: Path) -> bool:
+    try:
+        return path.is_symlink() or bool(getattr(os.path, "isjunction", lambda _path: False)(path))
+    except OSError:
+        return True
+
+
+def _verified_media_tools(config_dir: Path, root: Path, *, verify_hashes: bool = True,
+                          cancel: Callable[[], None] | None = None) -> tuple[Path, dict]:
+    """Validate a receipt-v2 tool pair without consulting the host PATH.
+
+    The published archive digest establishes provenance. Per-file hashes in the
+    local receipt then detect damage after extraction and across future starts.
+    """
+    root = Path(root).resolve()
+    base = _base(config_dir).resolve()
+    if root != base and not root.is_relative_to(base):
+        raise ValueError("Runtime root escapes the managed installation")
+    receipt = _read(root / "receipt.json")
+    if type(receipt.get("schema_version")) is not int or receipt["schema_version"] != RECEIPT_SCHEMA_VERSION:
+        raise ValueError("The managed runtime does not have a v2 media-tool receipt")
+    recorded = receipt.get("media_tools")
+    if not isinstance(recorded, dict):
+        raise ValueError("The managed runtime has no verified media-tool receipt")
+
+    manifest = _read(root / "src" / MANIFEST_NAME)
+    _validate_manifest(manifest)
+    selected = _select_media_tools(manifest, receipt.get("profile_id", ""))
+    for receipt_key, catalog_key in (("set_id", "set_id"), ("revision", "revision"),
+                                     ("platform", "platform"), ("architecture", "architecture")):
+        if recorded.get(receipt_key) != selected.get(catalog_key):
+            raise ValueError("The media-tool receipt does not match the runtime catalog")
+    expected_archives = sorted(
+        ({"sha256": archive["sha256"].lower(), "size": archive["size"]}
+         for archive in selected["archives"]), key=lambda row: row["sha256"])
+    actual_archives = recorded.get("archives")
+    if not isinstance(actual_archives, list):
+        raise ValueError("The media-tool archive receipt is missing")
+    normalized_archives = []
+    for archive in actual_archives:
+        if (not isinstance(archive, dict) or set(archive) != {"sha256", "size"}
+                or not _SHA.fullmatch(str(archive.get("sha256", "")))
+                or type(archive.get("size")) is not int or archive["size"] < 1):
+            raise ValueError("The media-tool archive receipt is invalid")
+        normalized_archives.append({"sha256": archive["sha256"].lower(), "size": archive["size"]})
+    if sorted(normalized_archives, key=lambda row: row["sha256"]) != expected_archives:
+        raise ValueError("The media-tool archive receipt does not match the runtime catalog")
+
+    if recorded.get("asset_dir") != "tools/bin":
+        raise ValueError("The media-tool directory is not generation-owned")
+    relative = _safe_relative(recorded["asset_dir"])
+    unresolved = root / relative
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if _is_link_like(cursor):
+            raise ValueError("The media-tool directory cannot contain links")
+    tool_dir = unresolved.resolve()
+    if tool_dir != (root / "tools" / "bin").resolve() or not tool_dir.is_relative_to(root):
+        raise ValueError("The media-tool directory escapes its generation")
+
+    files = recorded.get("files")
+    expected_names = set(_canonical_media_names(recorded.get("platform")))
+    if not isinstance(files, list) or len(files) != len(expected_names):
+        raise ValueError("The media-tool file receipt is incomplete")
+    seen: set[str] = set()
+    normalized_files = []
+    for entry in files:
+        if (not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256"}
+                or type(entry.get("size")) is not int or not 1 <= entry["size"] <= _MAX_MEDIA_TOOL_BYTES
+                or not _SHA.fullmatch(str(entry.get("sha256", "")))):
+            raise ValueError("The media-tool file receipt is invalid")
+        name = _safe_basename(entry.get("path"), "media-tool output")
+        if name not in expected_names or name in seen:
+            raise ValueError("The media-tool file receipt is not the canonical pair")
+        seen.add(name)
+        path = tool_dir / name
+        if _is_link_like(path) or not path.is_file() or path.stat().st_size != entry["size"]:
+            raise ValueError(f"Managed media tool is missing or damaged: {name}")
+        if os.name != "nt" and not os.access(path, os.X_OK):
+            raise ValueError(f"Managed media tool is not executable: {name}")
+        if verify_hashes and _hash_file(path, cancel).lower() != entry["sha256"].lower():
+            raise ValueError(f"Managed media tool failed receipt verification: {name}")
+        normalized_files.append({"path": name, "size": entry["size"], "sha256": entry["sha256"].lower()})
+    if seen != expected_names:
+        raise ValueError("The media-tool file receipt is not the canonical pair")
+    return tool_dir, {**recorded, "archives": normalized_archives,
+                      "files": sorted(normalized_files, key=lambda row: row["path"])}
+
+
+def verified_media_tools_dir(config_dir: Path, root: Path | None = None) -> Path:
+    """Return a fully rehashed generation tool directory or fail closed."""
+    directory, _ = _verified_media_tools(config_dir, root or active_root(config_dir))
+    return directory
+
+
+def _media_tools_inventory(config_dir: Path, root: Path, receipt: dict) -> dict:
+    if receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION:
+        return {"state": "legacy_unverified"}
+    recorded = receipt.get("media_tools") if isinstance(receipt.get("media_tools"), dict) else {}
+    public = {key: recorded.get(key) for key in ("set_id", "revision", "platform", "architecture")}
+    try:
+        _, verified = _verified_media_tools(config_dir, root, verify_hashes=False)
+        # Inventory is used by the settings poll endpoint, so keep it cheap and
+        # call this what it is: catalog/receipt/size presence. Every child start,
+        # candidate validation and rollback performs the full per-file rehash.
+        public.update(state="present", verification="rehash_on_use",
+                      files=[{"path": row["path"], "size": row["size"]}
+                             for row in verified["files"]])
+    except Exception as exc:
+        public.update(state="damaged", error=str(exc), files=[])
+    return public
 
 
 def status(config_dir: Path) -> dict:
@@ -352,12 +482,113 @@ def _assert_plan_source(config_dir: Path, plan: dict) -> dict:
 def _safe_relative(value: str) -> Path:
     posix = PurePosixPath(str(value))
     if not value or posix.is_absolute() or ".." in posix.parts or "\\" in value or ":" in value:
-        raise ValueError("Invalid model asset path")
+        raise ValueError("Invalid runtime asset path")
     return Path(*posix.parts)
 
 
+def _normalized_architecture(value: str | None = None) -> str:
+    raw = str(value if value is not None else platform.machine()).strip().lower()
+    aliases = {
+        "amd64": "x86_64", "x64": "x86_64", "x86-64": "x86_64", "x86_64": "x86_64",
+        "arm64": "arm64", "aarch64": "arm64",
+    }
+    try:
+        return aliases[raw]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported runtime architecture: {raw or 'unknown'}") from exc
+
+
+def _canonical_media_names(target_platform: str) -> tuple[str, str]:
+    if target_platform not in _MEDIA_PLATFORMS:
+        raise ValueError(f"Unsupported media-tool platform: {target_platform}")
+    suffix = ".exe" if target_platform == "win32" else ""
+    return tuple(name + suffix for name in _MEDIA_TOOL_NAMES)
+
+
+def _safe_basename(value, label: str) -> str:
+    text = str(value)
+    if (not text or text in {".", ".."} or "/" in text or "\\" in text
+            or ":" in text or "\x00" in text or Path(text).name != text):
+        raise ValueError(f"Invalid {label} basename")
+    return text
+
+
+def _verified_https_url(value, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} requires HTTPS")
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError(f"{label} requires HTTPS")
+    return value
+
+
+def _validate_media_tool_catalog(manifest: dict) -> None:
+    catalog = manifest.get("media_tools")
+    if not isinstance(catalog, dict) or not catalog:
+        raise ValueError("Server did not publish a media-tool catalog")
+    profiles = manifest.get("profiles", {})
+    claimed_targets: set[tuple[str, str, str]] = set()
+    for set_id, toolset in catalog.items():
+        if not isinstance(set_id, str) or not _TOOLSET_ID.fullmatch(set_id) or not isinstance(toolset, dict):
+            raise ValueError("Invalid media-tool set identity")
+        target_platform = toolset.get("platform")
+        architecture = toolset.get("architecture")
+        if target_platform not in _MEDIA_PLATFORMS or architecture not in _MEDIA_ARCHES:
+            raise ValueError(f"Media-tool set {set_id} has an unsupported target")
+        for field in ("revision", "license", "source_url"):
+            value = toolset.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Media-tool set {set_id} requires {field}")
+        _verified_https_url(toolset["source_url"], "Media-tool source metadata")
+        supported_profiles = toolset.get("profiles")
+        if (not isinstance(supported_profiles, list) or not supported_profiles
+                or any(not isinstance(profile_id, str) for profile_id in supported_profiles)
+                or len(supported_profiles) != len(set(supported_profiles))
+                or any(profile_id not in profiles for profile_id in supported_profiles)):
+            raise ValueError(f"Media-tool set {set_id} references an invalid profile")
+        for profile_id in supported_profiles:
+            target = (profile_id, target_platform, architecture)
+            if target in claimed_targets:
+                raise ValueError(f"Duplicate media-tool target: {profile_id}/{target_platform}/{architecture}")
+            claimed_targets.add(target)
+        archives = toolset.get("archives")
+        if not isinstance(archives, list) or not archives:
+            raise ValueError(f"Media-tool set {set_id} has no verified archive")
+        expected = set(_canonical_media_names(target_platform))
+        outputs: set[str] = set()
+        source_names: set[str] = set()
+        archive_digests: set[str] = set()
+        for archive in archives:
+            if not isinstance(archive, dict):
+                raise ValueError("Invalid media-tool archive entry")
+            url, digest = archive.get("url"), str(archive.get("sha256", ""))
+            size, archive_format = archive.get("size"), archive.get("format")
+            _verified_https_url(url, "Media-tool download")
+            if not _SHA.fullmatch(digest) or digest.lower() in archive_digests:
+                raise ValueError("Media-tool archives require distinct full SHA-256 digests")
+            if type(size) is not int or size < 1:
+                raise ValueError("Media-tool archives require byte sizes")
+            if archive_format not in _MEDIA_ARCHIVE_FORMATS:
+                raise ValueError("Unsupported media-tool archive format")
+            members = archive.get("members")
+            if not isinstance(members, dict) or not members:
+                raise ValueError("Media-tool archives require an explicit member map")
+            archive_digests.add(digest.lower())
+            for output, source in members.items():
+                if not isinstance(output, str) or not isinstance(source, str):
+                    raise ValueError("Media-tool member mappings require string basenames")
+                output = _safe_basename(output, "media-tool output")
+                source = _safe_basename(source, "media-tool source")
+                if output not in expected or output in outputs or source in source_names:
+                    raise ValueError("Media-tool member mappings must be canonical and unique")
+                outputs.add(output)
+                source_names.add(source)
+        if outputs != expected:
+            raise ValueError(f"Media-tool set {set_id} must provide ffmpeg and ffprobe")
+
+
 def _validate_manifest(manifest: dict):
-    if manifest.get("schema_version") != SCHEMA_VERSION:
+    if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != MANIFEST_SCHEMA_VERSION:
         raise ValueError("Unsupported server runtime manifest version")
     if not isinstance(manifest.get("profiles"), dict) or not manifest["profiles"]:
         raise ValueError("Server did not publish a compatibility profile")
@@ -382,6 +613,23 @@ def _validate_manifest(manifest: dict):
         entry = model["entrypoint"] + (".yaml" if model["engine"] == "demucs" and not model["entrypoint"].endswith(".yaml") else "")
         if not seen or str(_safe_relative(entry)) not in seen:
             raise ValueError("The model entrypoint must be a verified catalog asset")
+    _validate_media_tool_catalog(manifest)
+
+
+def _select_media_tools(manifest: dict, profile_id: str, *, target_platform: str | None = None,
+                        architecture: str | None = None) -> dict:
+    target_platform = target_platform or sys.platform
+    architecture = _normalized_architecture(architecture)
+    matches = []
+    for set_id, toolset in manifest["media_tools"].items():
+        if (toolset["platform"] == target_platform and toolset["architecture"] == architecture
+                and profile_id in toolset["profiles"]):
+            matches.append({"set_id": set_id, **toolset})
+    if not matches:
+        raise ValueError(f"No verified FFmpeg tools for {target_platform}/{architecture} and profile {profile_id}")
+    if len(matches) != 1:
+        raise ValueError(f"Ambiguous FFmpeg tools for {target_platform}/{architecture} and profile {profile_id}")
+    return matches[0]
 
 
 def _select_profile(manifest: dict, gpu: bool, cuda_tag: str | None) -> tuple[str, dict]:
@@ -464,6 +712,7 @@ def check_updates(config_dir: Path, ref: str | None = None, model: str = "bs_rof
                     else _load_manifest(commit))
         _validate_manifest(manifest)
         profile_id, profile = _select_profile(manifest, gpu, tag)
+        media_tools = _select_media_tools(manifest, profile_id)
         model_ids = sorted(set(installed.get("models", {})) | {model})
         missing = [name for name in model_ids if name not in manifest["models"]]
         if missing:
@@ -483,12 +732,17 @@ def check_updates(config_dir: Path, ref: str | None = None, model: str = "bs_rof
         model_rows = [{"id": name, "installed": installed.get("models", {}).get(name, {}).get("revision"),
                        "available": spec["revision"], "state": "current" if installed.get("models", {}).get(name, {}).get("revision") == spec["revision"] else "available",
                        "download_bytes": sum(asset["size"] for asset in spec["assets"])} for name, spec in models.items()]
+        media_download = sum(archive["size"] for archive in media_tools["archives"])
+        media_available = {key: media_tools[key] for key in
+                           ("set_id", "revision", "platform", "architecture", "license", "source_url")}
+        media_available["download_bytes"] = media_download
         plan = {**result, "plan_id": uuid.uuid4().hex, "created_at": time.time(), "state": "available",
                 "can_update": True, "ref": ref, "source_commit": commit, "profile_id": profile_id,
                 "source": {**source, "commit": commit}, "source_identity_sha256": _digest(source),
                 "profile": profile, "manifest": manifest, "manifest_sha256": _digest(manifest),
-                "available": {"server": commit, "dependencies": releases, "models": model_rows},
-                "gpu": gpu, "cuda_tag": tag, "model_specs": models,
+                "available": {"server": commit, "dependencies": releases, "models": model_rows,
+                              "media_tools": media_available},
+                "gpu": gpu, "cuda_tag": tag, "model_specs": models, "media_tool_spec": media_tools,
                 "server_state": "current" if installed.get("source_commit") == commit and
                     installed_repo.lower() == source["repo"].lower() else "available",
                 "libraries_state": "refresh_available" if "libraries" in selected else "unchanged",
@@ -593,6 +847,9 @@ def _get_plan(config_dir: Path, plan_id: str) -> dict:
     _validate_manifest(plan["manifest"])
     if _digest(plan["manifest"]) != plan.get("manifest_sha256"):
         raise ValueError("Update manifest changed after planning")
+    selected_tools = _select_media_tools(plan["manifest"], plan.get("profile_id", ""))
+    if _digest(selected_tools) != _digest(plan.get("media_tool_spec")):
+        raise ValueError("Update media-tool selection changed after planning")
     return plan
 
 
@@ -613,17 +870,179 @@ def _download_file(url: str, target: Path, cancel, *, size: int | None = None,
                         continue
                     count += len(block)
                     if size is not None and count > size:
-                        raise ValueError("Downloaded model is larger than its published size")
+                        raise ValueError("Downloaded runtime asset is larger than its published size")
                     digest.update(block)
                     handle.write(block)
         cancel()
         if size is not None and count != size:
-            raise ValueError("Downloaded model has an incorrect size")
+            raise ValueError("Downloaded runtime asset has an incorrect size")
         if sha256 and digest.hexdigest().lower() != sha256.lower():
-            raise ValueError("Downloaded model failed SHA-256 verification")
+            raise ValueError("Downloaded runtime asset failed SHA-256 verification")
         os.replace(partial, target)
     finally:
         partial.unlink(missing_ok=True)
+
+
+def _safe_archive_path(value: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        raise ValueError("Media-tool archive contains an unsafe path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts or any(":" in part for part in path.parts):
+        raise ValueError("Media-tool archive contains an unsafe path")
+    return path
+
+
+def _write_media_member(source, target: Path, cancel) -> dict:
+    partial = target.with_name(target.name + ".partial")
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        with partial.open("wb") as output:
+            while True:
+                cancel()
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                count += len(block)
+                if count > _MAX_MEDIA_TOOL_BYTES:
+                    raise ValueError("Extracted media tool exceeds the safety limit")
+                digest.update(block)
+                output.write(block)
+        if count < 1:
+            raise ValueError("Extracted media tool is empty")
+        os.replace(partial, target)
+        if os.name != "nt":
+            target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return {"path": target.name, "size": count, "sha256": digest.hexdigest()}
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def _extract_media_archive(archive_path: Path, archive: dict, target_dir: Path, cancel) -> list[dict]:
+    """Copy only explicitly mapped regular files to canonical destinations."""
+    requested = dict(archive["members"])
+    selected = {}
+    if archive["format"] == "zip":
+        with zipfile.ZipFile(archive_path) as handle:
+            infos = handle.infolist()
+            if len(infos) > 100000:
+                raise ValueError("Media-tool archive contains too many entries")
+            for info in infos:
+                cancel()
+                path = _safe_archive_path(info.filename)
+                matches = [output for output, source in requested.items() if path.name == source]
+                if not matches:
+                    continue
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if (len(matches) != 1 or matches[0] in selected or info.is_dir()
+                        or (mode and stat.S_ISLNK(mode)) or info.flag_bits & 0x1
+                        or not 1 <= info.file_size <= _MAX_MEDIA_TOOL_BYTES):
+                    raise ValueError("Media-tool archive member is ambiguous or unsafe")
+                selected[matches[0]] = info
+            if set(selected) != set(requested):
+                raise ValueError("Media-tool archive is missing a unique required member")
+            results = []
+            for output in requested:
+                cancel()
+                with handle.open(selected[output], "r") as source:
+                    results.append(_write_media_member(source, target_dir / output, cancel))
+            return results
+
+    if archive["format"] == "tar.xz":
+        with tarfile.open(archive_path, mode="r:xz") as handle:
+            infos = handle.getmembers()
+            if len(infos) > 100000:
+                raise ValueError("Media-tool archive contains too many entries")
+            for info in infos:
+                cancel()
+                path = _safe_archive_path(info.name)
+                matches = [output for output, source in requested.items() if path.name == source]
+                if not matches:
+                    continue
+                if (len(matches) != 1 or matches[0] in selected or not info.isfile()
+                        or not 1 <= info.size <= _MAX_MEDIA_TOOL_BYTES):
+                    raise ValueError("Media-tool archive member is ambiguous or unsafe")
+                selected[matches[0]] = info
+            if set(selected) != set(requested):
+                raise ValueError("Media-tool archive is missing a unique required member")
+            results = []
+            for output in requested:
+                cancel()
+                source = handle.extractfile(selected[output])
+                if source is None:
+                    raise ValueError("Media-tool archive member could not be read")
+                with source:
+                    results.append(_write_media_member(source, target_dir / output, cancel))
+            return results
+    raise ValueError("Unsupported media-tool archive format")
+
+
+def _stage_media_tools(config_dir: Path, root: Path, plan: dict, cancel, callback) -> dict:
+    spec = plan["media_tool_spec"]
+    target_dir = root / "tools" / "bin"
+    target_dir.mkdir(parents=True, exist_ok=False)
+    archive_receipts = []
+    file_receipts = []
+    for archive in spec["archives"]:
+        cancel()
+        digest = archive["sha256"].lower()
+        store = owned_path(config_dir, Path("media-assets") / digest)
+        reusable = (store.is_file() and not _is_link_like(store)
+                    and store.stat().st_size == archive["size"]
+                    and _hash_file(store, cancel).lower() == digest)
+        if not reusable:
+            _event(config_dir, callback, "downloading", .07,
+                   f"Downloading verified media tools for {spec['platform']}/{spec['architecture']}")
+            _download_file(archive["url"], store, cancel, size=archive["size"], sha256=digest)
+        else:
+            _event(config_dir, callback, "validating", .07,
+                   f"Reusing verified media tools for {spec['platform']}/{spec['architecture']}")
+        file_receipts.extend(_extract_media_archive(store, archive, target_dir, cancel))
+        archive_receipts.append({"sha256": digest, "size": archive["size"]})
+    expected = set(_canonical_media_names(spec["platform"]))
+    if {entry["path"] for entry in file_receipts} != expected or len(file_receipts) != len(expected):
+        raise ValueError("Staged media tools are not the canonical FFmpeg/FFprobe pair")
+    return {"set_id": spec["set_id"], "revision": spec["revision"],
+            "platform": spec["platform"], "architecture": spec["architecture"],
+            "asset_dir": "tools/bin", "archives": archive_receipts,
+            "files": sorted(file_receipts, key=lambda row: row["path"])}
+
+
+def _validate_media_tools(config_dir: Path, root: Path, cancel) -> None:
+    """Exercise the contained pair before installing Python or model payloads."""
+    validation = root / "validation"
+    validation.mkdir(exist_ok=True)
+    env = _candidate_env(config_dir, root, validation / "cache")
+    tool_dir, _ = _verified_media_tools(config_dir, root, cancel=cancel)
+    canonical = _canonical_media_names(sys.platform)
+    version_probe = (
+        "import subprocess\n"
+        f"for command in {list(canonical)!r}:\n"
+        " p=subprocess.run([command,'-version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=30)\n"
+        " assert p.returncode == 0 and p.stdout.strip(), command+' version check failed'\n"
+    )
+    _run_process([sys.executable, "-B", "-c", version_probe], env, cancel, timeout=60)
+
+    fixture = validation / "media-input.wav"
+    with wave.open(str(fixture), "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b"\0\0\0\0" * 800)
+    encoded = validation / "media-output.flac"
+    _run_external_process([str(tool_dir / canonical[0]), "-nostdin", "-hide_banner", "-loglevel", "error",
+                           "-y", "-i", str(fixture), "-c:a", "flac", str(encoded)],
+                          env, cancel, timeout=60)
+    output = _run_external_process([str(tool_dir / canonical[1]), "-v", "error", "-select_streams", "a:0",
+                                    "-show_entries", "stream=codec_name,sample_rate,channels", "-of", "json",
+                                    str(encoded)], env, cancel, timeout=60)
+    try:
+        stream = json.loads(output)["streams"][0]
+        valid = stream.get("codec_name") == "flac" and int(stream.get("sample_rate")) == 8000 and int(stream.get("channels")) == 2
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        valid = False
+    if not valid:
+        raise RuntimeError("Contained FFmpeg/FFprobe round-trip produced invalid audio metadata")
 
 
 def _stage_source(config_dir: Path, root: Path, plan: dict, cancel) -> None:
@@ -662,8 +1081,12 @@ def _disk_budget(config_dir: Path, plan: dict) -> None:
     # Rebuilding always needs a separate tree, even if wheels are already in pip's
     # cache. This is a conservative estimate, not a promise of exact download size.
     models = sum(a["size"] for m in plan["model_specs"].values() for a in m["assets"])
+    media_archives = sum(archive["size"] for archive in plan["media_tool_spec"]["archives"])
     libraries = (12 if plan["gpu"] else 6) * 1024**3 if "libraries" in plan["components"] else 0
-    needed = libraries + models * 2 + 512 * 1024**2
+    # Keep the verified archive in the content-addressed store and extract a
+    # separate immutable pair. Three archive sizes conservatively cover the
+    # compressed payload, extracted files and update headroom.
+    needed = libraries + models * 2 + media_archives * 3 + 512 * 1024**2
     path = _base(config_dir)
     path.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(path).free < needed:
@@ -808,6 +1231,21 @@ def _run_process(args: list[str], env: dict, cancel, *, timeout: float = 600, cw
             _terminate_process(proc)
 
 
+def _run_external_process(args: list[str], env: dict, cancel, *, timeout: float = 600,
+                          cwd: Path | None = None) -> str:
+    """Run a non-Python validator beneath the crash-watched Python worker."""
+    if not args or not isinstance(args[0], str) or not args[0]:
+        raise ValueError("Missing external validation command")
+    payload = (
+        "import subprocess,sys\n"
+        f"p=subprocess.run({list(args)!r},stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)\n"
+        "sys.stdout.write(p.stdout or '')\n"
+        "raise SystemExit(p.returncode)\n"
+    )
+    return _run_process([sys.executable, "-B", "-c", payload], env, cancel,
+                        timeout=timeout, cwd=cwd)
+
+
 def _candidate_env(config_dir: Path, root: Path, cache: Path) -> dict:
     import demucs_server as ds
     with ds.installation_context(root, cache):
@@ -934,16 +1372,21 @@ def _stage_candidate(config_dir: Path, plan: dict, cancel, callback) -> Path:
     root = _generation(config_dir, identity)
     root.mkdir(parents=True, exist_ok=False)
     _persist(config_dir, generation_id=identity, previous_generation=_active_id(config_dir), plan_id=plan["plan_id"])
-    receipt = {"schema_version": SCHEMA_VERSION, "generation_id": identity, "source_commit": plan["source_commit"],
+    receipt = {"schema_version": RECEIPT_SCHEMA_VERSION, "generation_id": identity, "source_commit": plan["source_commit"],
                "source": plan.get("source"),
                "profile_id": plan["profile_id"], "manifest_sha256": plan["manifest_sha256"],
                "created_at": time.time(), "owner": "stem_splitter", "validated": False,
                "prepared": False, "python": platform.python_version(), "platform": sys.platform,
-               "dependencies": {}, "models": {}}
+               "dependencies": {}, "models": {}, "media_tools": {}}
     _atomic_json(root / "receipt.json", receipt)
     _event(config_dir, callback, "downloading", 0.04, "Downloading the exact server revision")
     _stage_source(config_dir, root, plan, cancel)
     receipt["source"] = _read(root / "source.json")
+    cancel()
+    receipt["media_tools"] = _stage_media_tools(config_dir, root, plan, cancel, callback)
+    _atomic_json(root / "receipt.json", receipt)
+    _event(config_dir, callback, "validating", .1, "Verifying contained FFmpeg and FFprobe")
+    _validate_media_tools(config_dir, root, cancel)
     cancel()
     if "libraries" in plan["components"]:
         _event(config_dir, callback, "installing", 0.12, "Resolving compatible dependencies in a separate runtime")
@@ -1052,6 +1495,15 @@ def _activate(config_dir: Path, root: Path, plan: dict, cancel, callback,
     target_id = "legacy" if root == _base(config_dir) else root.name
     old_pointer_path = _base(config_dir) / "active.json"
     old_pointer = _read(old_pointer_path) if old_pointer_path.exists() else None
+    if rolling_back and target_id != "legacy":
+        rollback_receipt = _read(root / "receipt.json")
+        receipt_version = rollback_receipt.get("schema_version")
+        if receipt_version == RECEIPT_SCHEMA_VERSION:
+            _event(config_dir, callback, "validating", .82,
+                   "Revalidating the previous runtime's contained media tools")
+            _verified_media_tools(config_dir, root, cancel=cancel)
+        elif receipt_version != 1:
+            raise ValueError("The previous runtime receipt version is unsupported")
     was_running, live_port = ds.is_running(config_dir)
     port = int(live_port or port) if was_running else port
     old_state = ds._read_state(config_dir)

@@ -14,6 +14,8 @@ import demucs_server as ds
 
 DATA = b"verified test weights"
 CONFIG = b"inference: {num_overlap: 2}\n"
+FFMPEG = b"test ffmpeg executable"
+FFPROBE = b"test ffprobe executable"
 
 
 def asset(name, data):
@@ -22,11 +24,22 @@ def asset(name, data):
 
 
 def manifest():
-    return {"schema_version": 1,
+    target = sys.platform if sys.platform in {"win32", "linux", "darwin"} else "linux"
+    architecture = ru._normalized_architecture()
+    suffix = ".exe" if target == "win32" else ""
+    archive_digest = hashlib.sha256(b"test media archive").hexdigest()
+    return {"schema_version": 2,
             "profiles": {"test-profile": {"python": ">=3.10,<3.14", "platforms": ["win32", "linux", "darwin"],
                 "backends": ["cpu", "cuda"], "requirements": ["torch>=2.8,<2.9"],
                 "no_deps": ["audio-separator>=0.47,<0.48"],
                 "cuda_torch": {"torch": "2.8.0", "torchaudio": "2.8.0", "tags": ["cu126", "cu128"]}}},
+            "media_tools": {"test-media-tools": {"revision": "test-tools-v1", "platform": target,
+                "architecture": architecture, "profiles": ["test-profile"], "license": "GPL-3.0-or-later",
+                "source_url": "https://media.example.test/source", "archives": [{
+                    "url": "https://media.example.test/tools.zip", "size": len(b"test media archive"),
+                    "sha256": archive_digest, "format": "zip",
+                    "members": {"ffmpeg" + suffix: "ffmpeg" + suffix,
+                                "ffprobe" + suffix: "ffprobe" + suffix}}]}},
             "models": {"bs_roformer_sw": {"engine": "audio-separator", "revision": "weights-v1-config-v1",
                 "entrypoint": "BS-Roformer-SW.ckpt", "stems": ["guitar", "other"], "profiles": ["test-profile"],
                 "assets": [asset("BS-Roformer-SW.ckpt", DATA), asset("BS-Roformer-SW.yaml", CONFIG)]}}}
@@ -70,6 +83,23 @@ def fake_install(cfg, root, plan, cancel, callback):
     return {"torch": "2.8.0", "audio-separator": "0.47.0"}
 
 
+def fake_media_tools(cfg, root, plan, cancel, callback):
+    target = root / "tools" / "bin"
+    target.mkdir(parents=True)
+    names = ru._canonical_media_names(plan["media_tool_spec"]["platform"])
+    files = []
+    for name, payload in zip(names, (FFMPEG, FFPROBE)):
+        path = target / name
+        path.write_bytes(payload)
+        path.chmod(0o755)
+        files.append({"path": name, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()})
+    return {"set_id": plan["media_tool_spec"]["set_id"], "revision": plan["media_tool_spec"]["revision"],
+            "platform": plan["media_tool_spec"]["platform"],
+            "architecture": plan["media_tool_spec"]["architecture"], "asset_dir": "tools/bin",
+            "archives": [{"sha256": row["sha256"], "size": row["size"]}
+                         for row in plan["media_tool_spec"]["archives"]], "files": files}
+
+
 @pytest.fixture
 def sandbox(tmp_path):
     cfg = tmp_path / "profile"
@@ -81,6 +111,8 @@ def sandbox(tmp_path):
 def fake_runtime():
     with mock.patch.object(ru, "_disk_budget"), \
             mock.patch.object(ru, "_stage_source", side_effect=fake_source), \
+            mock.patch.object(ru, "_stage_media_tools", side_effect=fake_media_tools), \
+            mock.patch.object(ru, "_validate_media_tools"), \
             mock.patch.object(ru, "_install_dependencies", side_effect=fake_install), \
             mock.patch.object(ru, "_validate_candidate"), \
             mock.patch.object(ru, "_inference_smoke"), \
@@ -174,7 +206,48 @@ def test_install_promotes_complete_generation_and_preserves_legacy_assets(sandbo
     dl.assert_not_called()  # legacy weights reused only after real hash validation
 
 
-@pytest.mark.parametrize("failure_stage", ["_stage_source", "_install_dependencies", "_validate_candidate", "_inference_smoke"])
+def test_contained_media_tools_are_verified_before_dependencies_or_models(sandbox):
+    cfg, _ = sandbox
+    plan = make_plan(cfg)
+    order = []
+
+    def source(*args):
+        order.append("source")
+        return fake_source(*args)
+
+    def media(*args):
+        order.append("media")
+        return fake_media_tools(*args)
+
+    def verify_media(*args):
+        order.append("verify_media")
+
+    def libraries(*args):
+        order.append("libraries")
+        return fake_install(*args)
+
+    with mock.patch.object(ru, "_disk_budget"), mock.patch.object(ru, "_stage_source", side_effect=source), \
+            mock.patch.object(ru, "_stage_media_tools", side_effect=media), \
+            mock.patch.object(ru, "_validate_media_tools", side_effect=verify_media), \
+            mock.patch.object(ru, "_install_dependencies", side_effect=libraries), \
+            mock.patch.object(ru, "_stage_models", side_effect=lambda *args: order.append("models") or {}), \
+            mock.patch.object(ru, "_validate_candidate", side_effect=lambda *args: order.append("candidate")):
+        ru._stage_candidate(cfg, plan, lambda: None, None)
+    assert order == ["source", "media", "verify_media", "libraries", "models", "candidate"]
+
+
+def test_media_archive_is_included_in_conservative_disk_budget(tmp_path):
+    plan = {"gpu": False, "components": [], "model_specs": {},
+            "media_tool_spec": {"archives": [{"size": 100}]}}
+    # Base headroom plus 299 bytes would pass if the 100-byte archive were not
+    # budgeted three times for retained archive, extraction and staging headroom.
+    with mock.patch.object(ru.shutil, "disk_usage", return_value=mock.Mock(free=512 * 1024**2 + 299)):
+        with pytest.raises(RuntimeError, match="Not enough disk space"):
+            ru._disk_budget(tmp_path, plan)
+
+
+@pytest.mark.parametrize("failure_stage", ["_stage_source", "_stage_media_tools", "_validate_media_tools",
+                                            "_install_dependencies", "_validate_candidate", "_inference_smoke"])
 def test_candidate_failure_never_replaces_live_tree(sandbox, fake_runtime, failure_stage):
     cfg, base = sandbox
     plan = make_plan(cfg)
@@ -252,6 +325,23 @@ def test_rollback_restores_legacy_tree_without_deleting_candidate(sandbox, fake_
     assert result["state"] == "rolled_back"
     assert ru.active_root(cfg) == base
     assert candidate.is_dir()
+
+
+def test_stopped_server_rollback_rejects_damaged_v2_media_tools_before_pointer_switch(sandbox, fake_runtime):
+    cfg, base = sandbox
+    ru.apply_update(cfg, make_plan(cfg)["plan_id"])
+    previous = ru.active_root(cfg)
+    ru.apply_update(cfg, make_plan(cfg)["plan_id"])
+    active = ru.active_root(cfg)
+    pointer_before = (base / "active.json").read_bytes()
+    media_name = ru._canonical_media_names(sys.platform)[0]
+    damaged = previous / "tools" / "bin" / media_name
+    damaged.write_bytes(b"X" * damaged.stat().st_size)
+    with mock.patch.object(ds, "stop_server") as stop, pytest.raises(ValueError, match="receipt verification"):
+        ru.rollback(cfg, start_after=False)
+    stop.assert_not_called()
+    assert (base / "active.json").read_bytes() == pointer_before
+    assert ru.active_root(cfg) == active
 
 
 def test_active_and_rollback_generations_cannot_be_discarded(sandbox, fake_runtime):

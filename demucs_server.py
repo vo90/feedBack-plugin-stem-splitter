@@ -1770,8 +1770,8 @@ def server_health(url: str, timeout: float = 3.0) -> tuple[bool, dict]:
 
 def _server_env(config_dir: Path) -> dict:
     """Subprocess env: keep every weight cache inside our own dir, and make sure
-    ffmpeg (a hard prerequisite of the server) is on PATH by reusing the one the
-    feedBack app already bundles."""
+    receipt-v2 runtimes use only their own verified FFmpeg pair. Older installs
+    retain the app-bundle/PATH compatibility resolver until they are updated."""
     env = dict(os.environ)
     # Source selection belongs to this plugin host, never the downloaded server.
     for key in ("FEEDBACK_STEM_TEST_REPO", "FEEDBACK_STEM_TEST_CONFIG_DIR",
@@ -1787,9 +1787,25 @@ def _server_env(config_dir: Path) -> dict:
     # covers that case - but it's correct everywhere else and costs nothing.
     env["PYTHONPATH"] = str(pylibs_dir(config_dir))
 
-    receipt = installation_root(config_dir) / "receipt.json"
+    root = installation_root(config_dir)
+    receipt = root / "receipt.json"
+    managed_tool_dir = None
+    legacy_media_resolution = not receipt.is_file()
     if receipt.is_file():
         import runtime_update
+        try:
+            receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("The managed runtime receipt is damaged") from exc
+        receipt_version = receipt_data.get("schema_version")
+        if receipt_version == runtime_update.RECEIPT_SCHEMA_VERSION:
+            # This rehashes the exact catalog pair and fails closed. A host PATH
+            # ffmpeg must never conceal a missing/corrupt managed binary.
+            managed_tool_dir = runtime_update.verified_media_tools_dir(config_dir, root)
+        elif receipt_version == 1:
+            legacy_media_resolution = True
+        else:
+            raise RuntimeError("The managed runtime receipt version is unsupported")
         env["FEEDBACK_RUNTIME_RECEIPT"] = str(receipt)
         env["FEEDBACK_MANAGEMENT_TOKEN"] = runtime_update.management_token(config_dir)
     else:
@@ -1827,15 +1843,18 @@ def _server_env(config_dir: Path) -> dict:
     env["HUGGINGFACE_HUB_CACHE"] = str(cache / "huggingface" / "hub")
     env.setdefault("PYTHONUNBUFFERED", "1")
 
-    try:
-        from audio import _ffmpeg_cmd  # feedBack's bundled ffmpeg resolver
-        ff = _ffmpeg_cmd()
-        if ff:
-            ffdir = str(Path(ff).parent)
-            env["PATH"] = ffdir + os.pathsep + env.get("PATH", "")
-    except Exception as e:
-        log.warning("stem_splitter: could not resolve bundled ffmpeg (%s); the "
-                    "server needs ffmpeg on PATH", e)
+    if managed_tool_dir is not None:
+        env["PATH"] = str(managed_tool_dir) + os.pathsep + env.get("PATH", "")
+    elif legacy_media_resolution:
+        try:
+            from audio import _ffmpeg_cmd  # feedBack's bundled ffmpeg resolver
+            ff = _ffmpeg_cmd()
+            if ff:
+                ffdir = str(Path(ff).parent)
+                env["PATH"] = ffdir + os.pathsep + env.get("PATH", "")
+        except Exception as e:
+            log.warning("stem_splitter: could not resolve bundled ffmpeg (%s); the "
+                        "legacy server needs ffmpeg on PATH", e)
     return env
 
 
