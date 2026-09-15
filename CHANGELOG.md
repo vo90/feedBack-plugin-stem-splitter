@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Managed server generations now include a platform/architecture-specific,
+  SHA-256-verified FFmpeg and FFprobe pair instead of depending on the computer's
+  PATH. The updater extracts only the two catalogued executables, records their
+  hashes in the generation receipt, and exercises an encode/probe round trip
+  before downloading Python libraries or stem models. Starts and rollbacks fail
+  closed if the contained pair is missing or changed.
 - Separate **Install NVIDIA GPU support** from **Run on**: CUDA-enabled
   libraries also support CPU processing. Candidate separation checks use the
   same explicit CPU isolation as the updated server. Changing the running
