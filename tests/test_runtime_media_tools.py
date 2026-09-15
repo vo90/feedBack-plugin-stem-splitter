@@ -270,10 +270,19 @@ def test_early_validation_checks_bare_names_and_audio_roundtrip(tmp_path):
 
     with mock.patch.object(ru, "_candidate_env", return_value={"PATH": str(tool_dir)}), \
             mock.patch.object(ru, "_verified_media_tools", return_value=(tool_dir, {})), \
-            mock.patch.object(ru, "_run_process", side_effect=run):
+            mock.patch.object(ru, "_run_process", side_effect=run), \
+            mock.patch.object(ru, "_run_external_process", side_effect=run):
         ru._validate_media_tools(tmp_path, root, lambda: None)
     assert len(calls) == 3
     assert "subprocess.run" in calls[0][-1]
     assert names[0] in calls[0][-1] and names[1] in calls[0][-1]
     assert calls[1][0] == str(tool_dir / names[0])
     assert calls[2][0] == str(tool_dir / names[1])
+
+
+def test_external_validation_runs_beneath_the_guarded_worker(tmp_path):
+    output = ru._run_external_process(
+        [sys.executable, "-c", "print('MEDIA_TOOL_CHILD_OK')"],
+        dict(os.environ), lambda: None, timeout=30, cwd=tmp_path,
+    )
+    assert "MEDIA_TOOL_CHILD_OK" in output

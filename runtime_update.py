@@ -991,7 +991,7 @@ def _validate_media_tools(config_dir: Path, root: Path, cancel) -> None:
         " p=subprocess.run([command,'-version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=30)\n"
         " assert p.returncode == 0 and p.stdout.strip(), command+' version check failed'\n"
     )
-    _run_process([sys.executable, "-I", "-B", "-c", version_probe], env, cancel, timeout=60)
+    _run_process([sys.executable, "-B", "-c", version_probe], env, cancel, timeout=60)
 
     fixture = validation / "media-input.wav"
     with wave.open(str(fixture), "wb") as handle:
@@ -1000,11 +1000,12 @@ def _validate_media_tools(config_dir: Path, root: Path, cancel) -> None:
         handle.setframerate(8000)
         handle.writeframes(b"\0\0\0\0" * 800)
     encoded = validation / "media-output.flac"
-    _run_process([str(tool_dir / canonical[0]), "-nostdin", "-hide_banner", "-loglevel", "error",
-                  "-y", "-i", str(fixture), "-c:a", "flac", str(encoded)], env, cancel, timeout=60)
-    output = _run_process([str(tool_dir / canonical[1]), "-v", "error", "-select_streams", "a:0",
-                           "-show_entries", "stream=codec_name,sample_rate,channels", "-of", "json",
-                           str(encoded)], env, cancel, timeout=60)
+    _run_external_process([str(tool_dir / canonical[0]), "-nostdin", "-hide_banner", "-loglevel", "error",
+                           "-y", "-i", str(fixture), "-c:a", "flac", str(encoded)],
+                          env, cancel, timeout=60)
+    output = _run_external_process([str(tool_dir / canonical[1]), "-v", "error", "-select_streams", "a:0",
+                                    "-show_entries", "stream=codec_name,sample_rate,channels", "-of", "json",
+                                    str(encoded)], env, cancel, timeout=60)
     try:
         stream = json.loads(output)["streams"][0]
         valid = stream.get("codec_name") == "flac" and int(stream.get("sample_rate")) == 8000 and int(stream.get("channels")) == 2
@@ -1195,6 +1196,21 @@ def _run_process(args: list[str], env: dict, cancel, *, timeout: float = 600, cw
             return text
         finally:
             _terminate_process(proc)
+
+
+def _run_external_process(args: list[str], env: dict, cancel, *, timeout: float = 600,
+                          cwd: Path | None = None) -> str:
+    """Run a non-Python validator beneath the crash-watched Python worker."""
+    if not args or not isinstance(args[0], str) or not args[0]:
+        raise ValueError("Missing external validation command")
+    payload = (
+        "import subprocess,sys\n"
+        f"p=subprocess.run({list(args)!r},stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)\n"
+        "sys.stdout.write(p.stdout or '')\n"
+        "raise SystemExit(p.returncode)\n"
+    )
+    return _run_process([sys.executable, "-B", "-c", payload], env, cancel,
+                        timeout=timeout, cwd=cwd)
 
 
 def _candidate_env(config_dir: Path, root: Path, cache: Path) -> dict:
